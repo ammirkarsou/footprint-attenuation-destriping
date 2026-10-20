@@ -1,0 +1,13 @@
+# Local environment and credentials
+.agents/
+.aws/
+.codex/
+.env
+.env.*
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
