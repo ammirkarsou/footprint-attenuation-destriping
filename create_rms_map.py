@@ -44,6 +44,8 @@ horizon_encoding = "utf-8-sig"  # use "cp1252" for some older Windows exports
 # (depth) when the file headers do not describe the vertical axis correctly.
 sample_interval_override = None
 sample_start_override = None
+# Limit trace memory while reading large SEG-Y files. Lower this if RAM is tight.
+trace_chunk_size = 2048
 
 
 @njit(parallel=True, fastmath=True)
@@ -246,8 +248,10 @@ def sample_indices(top, bottom, start, interval):
     missing = np.iinfo(np.int32).min
     top_idx = np.full(len(top), missing, dtype=np.int32)
     bot_idx = np.full(len(bottom), missing, dtype=np.int32)
-    top_idx[valid] = np.rint((top[valid] - start) / interval).astype(np.int32)
-    bot_idx[valid] = np.rint((bottom[valid] - start) / interval).astype(np.int32)
+    # Include only samples whose coordinates actually lie inside the window.
+    # A tiny tolerance handles floating-point error at exact sample positions.
+    top_idx[valid] = np.ceil((top[valid] - start) / interval - 1e-9).astype(np.int32)
+    bot_idx[valid] = np.floor((bottom[valid] - start) / interval + 1e-9).astype(np.int32)
     return top_idx, bot_idx
 
 
@@ -263,7 +267,21 @@ def main():
         raise ValueError("window_mode must be 'constant' or 'horizon'")
     if vertical_domain not in ("time", "depth"):
         raise ValueError("vertical_domain must be 'time' or 'depth'")
+    if not isinstance(trace_chunk_size, int) or trace_chunk_size < 1:
+        raise ValueError("trace_chunk_size must be a positive integer")
+    if not Path(input_file).is_file():
+        raise FileNotFoundError(f"SEG-Y file not found: {input_file}; edit input_file")
+    outputs = [Path(path) for path in (output_rms_npy, output_il_npy, output_xl_npy)]
+    if any(output.suffix != ".npy" for output in outputs):
+        raise ValueError("RMS map and coordinate output filenames must end in .npy")
+    if len(set(outputs)) != len(outputs):
+        raise ValueError("RMS map and coordinate output paths must be different")
+    for output in outputs:
+        if not output.parent.is_dir():
+            raise FileNotFoundError(f"Output directory does not exist: {output.parent}")
     if window_mode == "horizon":
+        if not Path(horizon_file).is_file():
+            raise FileNotFoundError(f"Horizon file not found: {horizon_file}; edit horizon_file")
         scale = z_scale(horizon_z_unit, vertical_domain)
         if not horizon_windows:
             raise ValueError("horizon_windows must contain at least one interval")
@@ -274,17 +292,28 @@ def main():
 
     with segyio.open(input_file, mode="r", strict=False, ignore_geometry=True) as f:
         f.mmap()
+        n_traces = f.tracecount
+        if n_traces == 0:
+            raise ValueError("SEG-Y contains no traces")
         # SEG-Y stores time intervals in microseconds and depth intervals in
         # millimetres, giving ms or m after division by 1000.
         interval = (segyio.tools.dt(f) / 1000.0 if sample_interval_override is None
                     else sample_interval_override)
         start = (f.header[0][segyio.TraceField.DelayRecordingTime]
                  if sample_start_override is None else sample_start_override)
-        n_traces = f.tracecount
-        print(f"Loading {n_traces} traces ({f.samples.size} samples each)...")
-        traces = np.ascontiguousarray(f.trace.raw[:], dtype=np.float32)
+        if not np.isfinite(start):
+            raise ValueError("SEG-Y sample start must be finite")
+        if sample_start_override is None:
+            delays = f.attributes(segyio.TraceField.DelayRecordingTime)[:]
+            if np.any(delays != start):
+                raise ValueError(
+                    "SEG-Y traces have different recording delays; set "
+                    "sample_start_override only if a common sample start is correct"
+                )
         inlines = f.attributes(segyio.TraceField.INLINE_3D)[:]
         crosslines = f.attributes(segyio.TraceField.CROSSLINE_3D)[:]
+        print(f"Found {n_traces} traces ({f.samples.size} samples each); "
+              f"processing {trace_chunk_size} traces per chunk")
 
     if window_mode == "horizon":
         horizon_at_traces = interpolate_horizon(points, horizon_z, inlines, crosslines)
@@ -307,13 +336,32 @@ def main():
     xl_unique = np.unique(crosslines)
     grid_il = np.searchsorted(il_unique, inlines)
     grid_xl = np.searchsorted(xl_unique, crosslines)
+    linear_cell = grid_il.astype(np.int64) * len(xl_unique) + grid_xl
+    if len(np.unique(linear_cell)) != n_traces:
+        raise ValueError(
+            "SEG-Y has multiple traces at the same inline/crossline; "
+            "RMS maps require one trace per grid cell"
+        )
 
     for top, bottom, output_path in windows:
         top_idx, bot_idx = sample_indices(top, bottom, start, interval)
         print(f"Calculating RMS amplitude: {output_path}")
-        rms_values = calculate_horizon_rms_numba(traces, top_idx, bot_idx)
         rms_grid = np.full((len(il_unique), len(xl_unique)), np.nan, dtype=np.float32)
-        rms_grid[grid_il, grid_xl] = rms_values
+        with segyio.open(input_file, mode="r", strict=False, ignore_geometry=True) as f:
+            f.mmap()
+            for first in range(0, n_traces, trace_chunk_size):
+                last = min(first + trace_chunk_size, n_traces)
+                traces = np.ascontiguousarray(f.trace.raw[first:last], dtype=np.float32)
+                rms_grid[grid_il[first:last], grid_xl[first:last]] = (
+                    calculate_horizon_rms_numba(traces, top_idx[first:last], bot_idx[first:last])
+                )
+        valid_count = np.count_nonzero(np.isfinite(rms_grid))
+        if valid_count == 0:
+            raise ValueError(
+                f"{output_path}: no traces have samples inside this window; "
+                "check horizon units, sample interval/start, and window offsets"
+            )
+        print(f"Valid RMS bins: {valid_count}/{n_traces} traces")
         np.save(output_path, rms_grid)
         top_grid = np.full(rms_grid.shape, np.nan, dtype=np.float32)
         bottom_grid = np.full(rms_grid.shape, np.nan, dtype=np.float32)
@@ -325,6 +373,7 @@ def main():
             inlines=il_unique, crosslines=xl_unique,
             vertical_domain=vertical_domain,
             z_unit="ms" if vertical_domain == "time" else "m",
+            sample_interval=interval, sample_start=start,
         )
         print(f"RMS map saved: {output_path} (Shape: {rms_grid.shape})")
         print(f"Window bounds saved: {window_file}")

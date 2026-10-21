@@ -1,0 +1,72 @@
+# Copy this file, edit paths and parameters, then run:
+# python run_pipeline.py pipeline.yml
+# Relative paths are resolved from the YAML file's directory.
+input_segy: /path/to/input.sgy
+output_segy: /path/to/input_destriped.sgy
+# temporary_directory: /path/to/scratch  # defaults to the output directory
+cache_directory: .destriping_cache  # keep RMS maps and mask for later runs
+on_existing: prompt  # ask separately for RMS maps and mask: reuse or recalculate
+# For unattended runs, use on_existing: reuse or on_existing: recalculate.
+# Remove cache_directory for a one-time run that deletes all intermediates.
+
+geometry:
+  inline_spacing_m: 25.0
+  crossline_spacing_m: 25.0
+
+rms:
+  window_mode: horizon  # constant or horizon
+  vertical_domain: time  # time (ms) or depth (m)
+  horizon_file: /path/to/horizon.txt
+  horizon_z_unit: ms  # ms or s for time; m or ft for depth
+  horizon_windows:
+    - [0.0, 1400.0]
+    - [1400.0, 2800.0]
+  horizon_delimiter: auto  # whitespace, tab, comma, semicolon, pipe, fixed
+  horizon_columns: null  # or [inline_column, crossline_column, z_column], zero-based
+  horizon_fixed_widths: null  # e.g. [8, 8, 12] for fixed-width data
+  horizon_skip_rows: 0
+  horizon_missing_values: [NaN]
+  horizon_decimal: "."
+  horizon_encoding: utf-8-sig
+  sample_interval_override: null  # ms or m; only if SEG-Y header is wrong
+  sample_start_override: null  # ms or m; only if SEG-Y header is wrong
+  trace_chunk_size: 2048
+  # To use RMS maps already produced by create_rms_map.py, specify all maps
+  # in the same order as horizon_windows, plus the saved coordinate axes:
+  # existing_maps: [/path/to/map_1.npy, /path/to/map_2.npy]
+  # inlines_file: /path/to/Inlines.npy
+  # crosslines_file: /path/to/Crosslines.npy
+  # For a fixed window, use window_mode: constant, remove horizon settings,
+  # and set constant_top: 0.0 and constant_bottom: 1000.0.
+
+mask:
+  mode: interactive  # draw boundary and holes; click Finish Masks
+  preview_map_index: 0  # zero-based RMS map index to show when drawing
+  pad_inline_meters: 3000.0
+  pad_crossline_meters: 1000.0
+  # Reuse a mask already saved by create_mask.py, including its _holes.npz:
+  # existing_polygon_file: /path/to/selected_polygon.npy
+  # For a noninteractive run, set mode: vertices and provide coordinates:
+  # outer: [[200, 100], [300, 100], [300, 200], [200, 200]]
+  # holes:
+  #   - [[240, 140], [260, 140], [260, 160], [240, 160]]
+  # Coordinates are [crossline, inline], matching the polygon plot axes.
+
+attenuation:
+  parameter_input_mode: hardcoded  # or interactive for per-pass QC and prompts
+  pass_parameters:
+    - - [1000.0, inline, 2]
+      - [4000.0, crossline, 2]
+      - [16000.0, crossline, 2]
+      - 2.0
+  alpha: 0.3
+  pad_inline_meters: 3000.0
+  pad_crossline_meters: 200.0
+  filter_il_meters: 2000.0
+  filter_xl_meters: 2000.0
+  preview_hardcoded_passes: false
+  # colormap_file: /path/to/oslo.alut  # built-in seismic if unavailable
+
+application:
+  trace_chunk_size: 1024
+  overwrite_output: false

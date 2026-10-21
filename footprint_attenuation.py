@@ -1,4 +1,5 @@
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 from pathlib import Path as FilePath
@@ -6,6 +7,8 @@ from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 from scipy.ndimage import uniform_filter
 from numpy.lib.stride_tricks import sliding_window_view
 import re
+import ast
+from coefficient_interpolation import interpolate_trace_coefficients
 
 def load_seismic_colormap(cmap_path, name="custom_seismic", smooth=True):
     valid_rows = []
@@ -66,6 +69,9 @@ def alpha_trimmed_mean_1d(arr, axis, win_size, alpha=0.2, chunk_size=500,
 
     data = np.ascontiguousarray(arr.T) if axis == 0 else np.ascontiguousarray(arr)
     nrows, ncols = data.shape
+    # Sorting every filter window dominates temporary RAM on large maps.
+    # Keep each batch near 4 million window values, regardless of map width.
+    chunk_size = min(chunk_size, max(1, 4_000_000 // (ncols * win_size)))
     out = np.empty_like(data) if valid_mask is None else np.full_like(data, np.nan)
 
     padded = np.pad(data, ((0, 0), (pad_w, pad_w)), mode="edge")
@@ -135,14 +141,51 @@ def run_alpha_trim_pipeline(data, pipeline_steps, inc_il, inc_xl,
 
 # -------------------------------------------------------------
 def validate_pass(parameters):
-    if len(parameters) != 4:
-        raise ValueError("Pass must be (f1, f2, f3, a1)")
-    f1, f2, f3, a1 = (float(value) for value in parameters)
-    if not np.all(np.isfinite((f1, f2, f3, a1))):
-        raise ValueError("Pass parameters must be finite")
-    if f1 <= 0 or f2 <= 0 or f3 <= f2 or a1 < 0:
-        raise ValueError("Require f1 > 0, f2 > 0, f3 > f2, and a1 >= 0")
-    return f1, f2, f3, a1
+    """Normalize a pass to ((length, direction, repeats), ..., a1).
+
+    The four-number shorthand retains the original directions and two
+    repetitions for each filter.
+    """
+    try:
+        if len(parameters) != 4:
+            raise ValueError
+        if all(not isinstance(value, (list, tuple)) for value in parameters[:3]):
+            f1, f2, f3, multiplier = (float(value) for value in parameters)
+            filters = ((f1, "inline", 2), (f2, "crossline", 2),
+                       (f3, "crossline", 2))
+        else:
+            *filters, multiplier = parameters
+            multiplier = float(multiplier)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Pass must be (f1, f2, f3, a1) or "
+            "((f1, direction, repeats), (f2, direction, repeats), "
+            "(f3, direction, repeats), a1)"
+        ) from exc
+
+    normalized = []
+    for index, specification in enumerate(filters, start=1):
+        try:
+            length, direction, repeats = specification
+            length = float(length)
+            direction = direction.lower().strip()
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError(
+                f"Filter f{index} must be (length_metres, direction, repeats)"
+            ) from exc
+        if direction not in ("inline", "crossline"):
+            raise ValueError(f"Filter f{index} direction must be 'inline' or 'crossline'")
+        if isinstance(repeats, bool) or not isinstance(repeats, (int, np.integer)) or repeats < 1:
+            raise ValueError(f"Filter f{index} repeats must be a positive integer")
+        if not np.isfinite(length) or length <= 0:
+            raise ValueError(f"Filter f{index} length must be finite and positive")
+        normalized.append((length, direction, int(repeats)))
+
+    if not np.isfinite(multiplier) or multiplier < 0:
+        raise ValueError("a1 must be finite and nonnegative")
+    if normalized[2][0] <= normalized[1][0]:
+        raise ValueError("f3 must be longer than f2")
+    return (*normalized, multiplier)
 
 
 def parse_rms_map_entry(entry):
@@ -236,8 +279,12 @@ def prepare_input(rms_map, ilines, crosslines, polygon, holes):
         raise ValueError("RMS map shape does not match the inline/crossline axes")
     if not np.any(np.isfinite(rms_map)):
         raise ValueError("RMS map contains no finite samples")
+    if np.any(np.isinf(rms_map)):
+        raise ValueError("RMS map contains infinite samples; check the SEG-Y amplitudes")
     n_pad_il = int(np.round(pad_inline_meters / inline_increment))
     n_pad_xl = int(np.round(pad_crossline_meters / crossline_increment))
+    core = (slice(n_pad_il, n_pad_il + len(ilines)),
+            slice(n_pad_xl, n_pad_xl + len(crosslines)))
     p1, p99 = np.nanpercentile(rms_map, [1.0, 99.0])
     clipped = np.nan_to_num(np.clip(rms_map, p1, p99), nan=0.0)
     padded = np.pad(clipped, ((n_pad_il, n_pad_il), (n_pad_xl, n_pad_xl)),
@@ -270,28 +317,29 @@ def prepare_input(rms_map, ilines, crosslines, polygon, holes):
     if inside.size == 0:
         raise ValueError("No positive RMS samples remain inside the survey after excluding holes")
     median = float(np.median(inside))
+    # Missing trace bins must not become zero-valued stripes inside the survey.
+    padded[core][~np.isfinite(rms_map)] = median
     blended = padded * smooth + (1.0 - smooth) * median
     blended[hole_grid] = np.nan
-    core = (slice(n_pad_il, n_pad_il + len(ilines)),
-            slice(n_pad_xl, n_pad_xl + len(crosslines)))
     return {
         "input": blended, "outer": outer_grid, "holes": hole_grid,
         "valid_filter": ~hole_grid if holes else None, "core": core,
-        "extent": [padded_xl.min(), padded_xl.max(), padded_il.min(), padded_il.max()],
+        "extent": [padded_xl.min() - xl_step / 2, padded_xl.max() + xl_step / 2,
+                   padded_il.min() - il_step / 2, padded_il.max() + il_step / 2],
         "median": median,
     }
 
 
 def run_pass(input_map, parameters, valid_filter):
-    f1, f2, f3, a1 = validate_pass(parameters)
-    inline_steps = [("inline", f1, alpha)] * 2
-    short_steps = [("crossline", f2, alpha)] * 2
-    long_steps = [("crossline", f3, alpha)] * 2
+    primary_filter, short_filter, long_filter, a1 = validate_pass(parameters)
+    primary_steps = [(primary_filter[1], primary_filter[0], alpha)] * primary_filter[2]
+    short_steps = [(short_filter[1], short_filter[0], alpha)] * short_filter[2]
+    long_steps = [(long_filter[1], long_filter[0], alpha)] * long_filter[2]
 
-    inline_filtered = run_alpha_trim_pipeline(
-        input_map, inline_steps, inline_increment, crossline_increment, valid_filter
+    primary_filtered = run_alpha_trim_pipeline(
+        input_map, primary_steps, inline_increment, crossline_increment, valid_filter
     )
-    difference = inline_filtered - input_map
+    difference = primary_filtered - input_map
     short_difference = run_alpha_trim_pipeline(
         difference, short_steps, inline_increment, crossline_increment, valid_filter
     )
@@ -327,8 +375,10 @@ def show_pass(map_file, number, parameters, input_map, result, extent, cmap):
     arrays = [input_map, result["difference"], result["short_difference"],
               result["long_difference"], result["filtered_difference"],
               result["coefficient"], result["filtered_coefficient"], result["output"]]
-    titles = ["Input blended RMS", "Inline difference", "Short crossline difference",
-              "Long crossline difference", "Selected/filtered difference",
+    primary_filter, short_filter, long_filter, _ = validate_pass(parameters)
+    titles = ["Input blended RMS", f"{primary_filter[1].title()} difference",
+              f"Short {short_filter[1]} difference",
+              f"Long {long_filter[1]} difference", "Selected/filtered difference",
               "Raw coefficient", "Filtered coefficient", "Output blended RMS"]
     diff_scale = np.nanpercentile(np.abs(result["difference"]), 97)
     amplitude_scale = np.nanpercentile(np.r_[input_map.ravel(), result["output"].ravel()], 99.9)
@@ -352,10 +402,21 @@ def show_pass(map_file, number, parameters, input_map, result, extent, cmap):
 def parse_pass_input(raw, default):
     if not raw.strip():
         if default is None:
-            raise ValueError("Enter f1, f2, f3, a1")
+            raise ValueError("Enter a pass tuple")
         return validate_pass(default)
-    fields = re.split(r"[,;\s]+", raw.strip().strip("()"))
-    return validate_pass(fields)
+    try:
+        values = ast.literal_eval(raw)
+    except (SyntaxError, ValueError) as exc:
+        # Keep whitespace/semicolon-separated four-number input convenient.
+        fields = re.split(r"[,;\s]+", raw.strip().strip("()"))
+        if len(fields) != 4:
+            raise ValueError(
+                "Enter (f1, f2, f3, a1) or "
+                "((f1, direction, repeats), (f2, direction, repeats), "
+                "(f3, direction, repeats), a1)"
+            ) from exc
+        values = fields
+    return validate_pass(values)
 
 
 def select_passes(map_file, prepared, cmap):
@@ -368,7 +429,7 @@ def select_passes(map_file, prepared, cmap):
     while True:
         if parameter_input_mode == "interactive":
             default = pass_parameters[suggestion] if suggestion < len(pass_parameters) else None
-            label = f"{default}" if default is not None else "f1,f2,f3,a1"
+            label = f"{default}" if default is not None else "pass tuple"
             raw = input(f"{map_file.name} pass {len(accepted)+1} [{label}; 'done' to finish]: ").strip()
             if raw.lower() in ("done", "stop"):
                 if not accepted:
@@ -423,36 +484,6 @@ def select_passes(map_file, prepared, cmap):
     return cumulative, current, accepted
 
 
-def interpolate_trace_coefficients(z_samples, top_z, bottom_z, coefficients):
-    """Interpolate accepted map coefficients at one trace's vertical samples.
-
-    Returns 1 outside the outer window bounds and for missing/holed picks.
-    Within the bounds, values vary linearly through window centers and taper
-    continuously to 1 at the first top and last bottom.
-    """
-    z_samples = np.asarray(z_samples, dtype=float)
-    tops = np.asarray(top_z, dtype=float)
-    bottoms = np.asarray(bottom_z, dtype=float)
-    values = np.asarray(coefficients, dtype=float)
-    valid = np.isfinite(tops) & np.isfinite(bottoms) & np.isfinite(values)
-    out = np.ones_like(z_samples, dtype=np.float32)
-    if not np.any(valid):
-        return out
-    centers = (tops[valid] + bottoms[valid]) / 2
-    order = np.argsort(centers)
-    centers = centers[order]
-    values = values[valid][order]
-    if len(centers) > 1 and np.any(np.diff(centers) <= 0):
-        raise ValueError("Window centers must increase at each trace")
-    start = np.min(tops[valid])
-    end = np.max(bottoms[valid])
-    knots = np.r_[start, centers, end]
-    knot_values = np.r_[1.0, values, 1.0]
-    inside = np.isfinite(z_samples) & (z_samples >= start) & (z_samples <= end)
-    out[inside] = np.interp(z_samples[inside], knots, knot_values)
-    return out
-
-
 def main():
     if not rms_maps:
         raise ValueError("Configure at least one RMS map in rms_maps")
@@ -462,17 +493,41 @@ def main():
         raise ValueError("rms_window_mode must be 'absolute' or 'horizon'")
     if inline_increment <= 0 or crossline_increment <= 0:
         raise ValueError("Inline and crossline increments must be positive")
+    if pad_inline_meters < 0 or pad_crossline_meters < 0:
+        raise ValueError("Padding distances must be non-negative")
+    if filter_il_meters <= 0 or filter_xl_meters <= 0:
+        raise ValueError("Polygon blending filter lengths must be positive")
     if parameter_input_mode not in ("interactive", "hardcoded"):
         raise ValueError("parameter_input_mode must be 'interactive' or 'hardcoded'")
     if parameter_input_mode == "hardcoded" and not pass_parameters:
         raise ValueError("Configure at least one tuple in pass_parameters for hardcoded mode")
+    if FilePath(output_bundle_file).suffix != ".npz":
+        raise ValueError("output_bundle_file must end in .npz")
+    if not FilePath(output_bundle_file).parent.is_dir():
+        raise FileNotFoundError(
+            f"Bundle output directory does not exist: {FilePath(output_bundle_file).parent}"
+        )
     ilines = np.load(il_file)
     crosslines = np.load(xl_file)
     polygon_path = FilePath(polygon_file)
     polygon = np.load(polygon_path)
     holes = load_holes(polygon_path)
     needs_plot = parameter_input_mode == "interactive" or preview_hardcoded_passes
-    cmap = load_seismic_colormap(colormap_file, smooth=True) if needs_plot else None
+    if needs_plot and matplotlib.get_backend().lower() in {
+        "agg", "pdf", "ps", "svg", "cairo", "template"
+    }:
+        raise RuntimeError(
+            "Pass previews need an interactive Matplotlib backend and a "
+            "graphical desktop. Install PyQt5 and run with MPLBACKEND=QtAgg "
+            "if needed, or use hardcoded mode without previews."
+        )
+    if needs_plot and FilePath(colormap_file).is_file():
+        cmap = load_seismic_colormap(colormap_file, smooth=True)
+    elif needs_plot:
+        print(f"Colormap file not found: {colormap_file}; using built-in seismic")
+        cmap = "seismic"
+    else:
+        cmap = None
     print(f"Using {len(holes)} excluded hole(s)")
 
     # Check all vertical knots and map dimensions before starting any passes.
@@ -482,6 +537,7 @@ def main():
     if rms_window_mode == "horizon" and any(top is not None for _, top, _ in map_entries):
         horizon_grid, horizon_scale = load_horizon_grid(ilines, crosslines)
     specifications = []
+    sampling_settings = []
     for filename, top, bottom in map_entries:
         map_file = FilePath(filename)
         top_grid, bottom_grid = read_window_bounds(
@@ -491,6 +547,29 @@ def main():
         if rms_shape != (len(ilines), len(crosslines)):
             raise ValueError(f"{map_file}: map shape does not match the coordinate axes")
         specifications.append((map_file, top_grid, bottom_grid))
+        sidecar = map_file.with_name(map_file.stem + "_window.npz")
+        settings = None
+        if sidecar.exists():
+            with np.load(sidecar, allow_pickle=False) as saved:
+                has_interval = "sample_interval" in saved.files
+                has_start = "sample_start" in saved.files
+                if has_interval != has_start:
+                    raise ValueError(f"{sidecar}: incomplete sample-axis metadata")
+                if has_interval:
+                    settings = (float(saved["sample_interval"]),
+                                float(saved["sample_start"]))
+        sampling_settings.append(settings)
+    known_settings = [settings for settings in sampling_settings if settings is not None]
+    sample_metadata = {}
+    if known_settings:
+        reference = known_settings[0]
+        if any(not np.allclose(settings, reference, rtol=0, atol=1e-6)
+               for settings in known_settings[1:]):
+            raise ValueError("RMS map sidecars have different sample interval/start settings")
+        if len(known_settings) == len(specifications):
+            sample_metadata = dict(sample_interval=reference[0], sample_start=reference[1])
+        else:
+            print("Some RMS maps lack sample-axis metadata; the bundle cannot verify it")
     specifications.sort(key=lambda spec: np.nanmedian((spec[1] + spec[2]) / 2))
     for previous, following in zip(specifications, specifications[1:]):
         before = (previous[1] + previous[2]) / 2
@@ -533,6 +612,7 @@ def main():
         rms_files=np.asarray([str(entry[0]) for entry in completed]),
         passes_json=json.dumps([entry[4] for entry in completed]),
         interpolation="linear_at_window_centers_taper_to_one_at_outer_bounds",
+        **sample_metadata,
     )
     print(f"Saved vertical interpolation bundle: {output_bundle_file}")
     print("Apply coefficients at SEG-Y samples by interpolating through each trace's window centers.")
@@ -569,8 +649,8 @@ output_bundle_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTi
 colormap_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/ScientificColourMaps8/oslo/oslo.alut"
 
 vertical_domain = "time"  # time: ms; depth: m. Must match the RMS map windows.
-inline_increment = 25.0
-crossline_increment = 25.0
+inline_increment = 25.0  # metres between adjacent inline samples in each RMS map
+crossline_increment = 25.0  # metres between adjacent crossline samples
 pad_inline_meters = 3000.0
 pad_crossline_meters = 200.0
 filter_il_meters = 2000.0  # polygon blending aperture
@@ -581,12 +661,19 @@ alpha = 0.3  # same alpha-trim value used by the previous script
 #   "interactive": type/review one tuple at a time; values below are suggestions.
 #   "hardcoded": run every tuple below in order for every RMS map, without prompts.
 parameter_input_mode = "interactive"  # change to "hardcoded" for batch processing
-# Each tuple is (inline length, short crossline length, long crossline length,
-# standard-deviation multiplier). Filter lengths are in metres.
+# Each pass is (f1, f2, f3, a1). Each filter is
+# (length_metres, "inline" or "crossline", number_of_repetitions).
+# f2 is the short filter and f3 is the long filter; f3 must be longer than f2.
+# The repetition count applies each time that filter is used in the pass.
+# The four-number shorthand (f1, f2, f3, a1) still means 2 inline f1 filters,
+# 2 crossline f2 filters, and 2 crossline f3 filters.
 pass_parameters = [
-    (1000.0, 4000.0, 16000.0, 2.0),
-    # (800.0, 3000.0, 12000.0, 1.5),
-    # (600.0, 2000.0, 8000.0, 1.0),
+    ((1000.0, "inline", 2),
+     (4000.0, "crossline", 2),
+     (16000.0, "crossline", 2),
+     2.0),
+    # ((800.0, "inline", 1), (3000.0, "crossline", 3),
+    #  (12000.0, "crossline", 1), 1.5),
 ]
 
 preview_hardcoded_passes = False  # display each QC plot in hardcoded mode

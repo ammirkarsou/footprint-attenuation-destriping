@@ -1,4 +1,6 @@
 import numpy as np
+import argparse
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 from matplotlib.widgets import PolygonSelector, Button
@@ -12,16 +14,13 @@ il_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test
 xl_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/KDM_NorthPolygon_Crosslines.npy"
 
 output_polygon_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/selected_polygon.npy"
-output_holes_file = str(FilePath(output_polygon_file).with_name(
-    FilePath(output_polygon_file).stem + "_holes.npz"
-))
 
 # -------------------------------------------------------------
 # 2. Geometry Spacing & Axis Padding Parameters
 # -------------------------------------------------------------
-# Bin spacing in meters per unit line
-inline_increment = 25.0       # meters per 1 inline
-crossline_increment = 25.0    # meters per 1 crossline
+# Physical distance between adjacent samples in the RMS grid.
+inline_increment = 25.0       # metres between adjacent inline samples
+crossline_increment = 25.0    # metres between adjacent crossline samples
 
 # Option A: Set padding in meters (set to None if defining by line count)
 pad_inline_meters = 3000.0     # extra margin in meters along inline direction
@@ -31,9 +30,38 @@ pad_crossline_meters = 1000.0 # extra margin in meters along crossline direction
 pad_inline_lines = None       # e.g., 20
 pad_crossline_lines = None    # e.g., 40
 
+# Optional command-line overrides let the YAML runner use temporary paths
+# without changing the standalone script's configuration above.
+parser = argparse.ArgumentParser(description="Draw a survey polygon and optional holes")
+parser.add_argument("--rms-file")
+parser.add_argument("--il-file")
+parser.add_argument("--xl-file")
+parser.add_argument("--output-polygon-file")
+parser.add_argument("--inline-increment", type=float)
+parser.add_argument("--crossline-increment", type=float)
+parser.add_argument("--pad-inline-meters", type=float)
+parser.add_argument("--pad-crossline-meters", type=float)
+args = parser.parse_args()
+for name in ("rms_file", "il_file", "xl_file", "output_polygon_file",
+             "inline_increment", "crossline_increment", "pad_inline_meters",
+             "pad_crossline_meters"):
+    value = getattr(args, name)
+    if value is not None:
+        globals()[name] = value
+output_holes_file = str(FilePath(output_polygon_file).with_name(
+    FilePath(output_polygon_file).stem + "_holes.npz"
+))
+
 # -------------------------------------------------------------
 # 3. Calculate Padding (Integer Line Counts)
 # -------------------------------------------------------------
+if matplotlib.get_backend().lower() in {"agg", "pdf", "ps", "svg", "cairo", "template"}:
+    raise RuntimeError(
+        "create_mask.py needs an interactive Matplotlib backend and a graphical "
+        "desktop. Install PyQt5 and run with MPLBACKEND=QtAgg if needed."
+    )
+if inline_increment <= 0 or crossline_increment <= 0:
+    raise ValueError("Inline and crossline increments must be positive")
 if pad_inline_meters is not None:
     n_pad_il = int(np.round(pad_inline_meters / inline_increment))
 else:
@@ -43,6 +71,14 @@ if pad_crossline_meters is not None:
     n_pad_xl = int(np.round(pad_crossline_meters / crossline_increment))
 else:
     n_pad_xl = int(pad_crossline_lines) if pad_crossline_lines is not None else 0
+if n_pad_il < 0 or n_pad_xl < 0:
+    raise ValueError("Padding must be non-negative")
+if FilePath(output_polygon_file).suffix != ".npy":
+    raise ValueError("output_polygon_file must end in .npy")
+if not FilePath(output_polygon_file).parent.is_dir():
+    raise FileNotFoundError(
+        f"Mask output directory does not exist: {FilePath(output_polygon_file).parent}"
+    )
 
 print(f"Inline padding   : {n_pad_il} lines ({n_pad_il * inline_increment:.1f} m)")
 print(f"Crossline padding: {n_pad_xl} lines ({n_pad_xl * crossline_increment:.1f} m)")
@@ -53,6 +89,12 @@ print(f"Crossline padding: {n_pad_xl} lines ({n_pad_xl * crossline_increment:.1f
 rms_map = np.load(rms_file)
 il_unique = np.load(il_file)
 xl_unique = np.load(xl_file)
+if rms_map.shape != (len(il_unique), len(xl_unique)):
+    raise ValueError("RMS map shape does not match the inline/crossline axes")
+if not np.any(np.isfinite(rms_map)):
+    raise ValueError("RMS map contains no finite samples")
+if np.any(np.isinf(rms_map)):
+    raise ValueError("RMS map contains infinite samples; check the SEG-Y amplitudes")
 
 # Dynamic range scaling (P1 to P99)
 p1, p99 = np.nanpercentile(rms_map, [1.0, 99.0])
@@ -123,7 +165,8 @@ im0 = ax.imshow(
     padded_map,
     origin="lower",
     aspect="auto",
-    extent=[new_xl_min, new_xl_max, new_il_min, new_il_max],
+    extent=[new_xl_min - xl_step / 2, new_xl_max + xl_step / 2,
+            new_il_min - il_step / 2, new_il_max + il_step / 2],
     cmap="viridis"
 )
 
@@ -272,3 +315,5 @@ plt.show()
 if masks_saved:
     print(f"\nSaved Polygon coordinates shape: {selected_polygon.shape}")
     print(f"Confirmed holes: {len(hole_polygons)}")
+else:
+    print("\nNo mask files were saved. Confirm the boundary and click Finish Masks.")
