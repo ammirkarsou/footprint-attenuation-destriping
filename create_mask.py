@@ -1,6 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.path import Path
 from matplotlib.widgets import PolygonSelector, Button
+from pathlib import Path as FilePath
 
 # -------------------------------------------------------------
 # 1. File Paths
@@ -10,6 +12,9 @@ il_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test
 xl_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/KDM_NorthPolygon_Crosslines.npy"
 
 output_polygon_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/selected_polygon.npy"
+output_holes_file = str(FilePath(output_polygon_file).with_name(
+    FilePath(output_polygon_file).stem + "_holes.npz"
+))
 
 # -------------------------------------------------------------
 # 2. Geometry Spacing & Axis Padding Parameters
@@ -123,8 +128,8 @@ im0 = ax.imshow(
 )
 
 ax.set_title(
-    "Interactive Polygon Picker\n"
-    "Left-click: Add points | Click 1st point: Close polygon | Drag vertices: Adjust | Enter: Confirm",
+    "Draw the survey boundary; click the first point to close it\n"
+    "Enter: confirm | Esc: redraw | Backspace: undo | Finish Masks: save",
     fontsize=11
 )
 ax.set_xlabel("Crossline")
@@ -132,6 +137,9 @@ ax.set_ylabel("Inline")
 fig.colorbar(im0, ax=ax, label="RMS Amplitude")
 
 selected_polygon = None
+hole_polygons = []
+confirmed_artists = []
+masks_saved = False
 
 def onselect(verts):
     pass
@@ -146,22 +154,84 @@ selector = PolygonSelector(
 
 def confirm(event=None):
     global selected_polygon
-    verts = selector.verts
+    verts = np.asarray(selector.verts, dtype=float)
 
     if len(verts) < 3:
         print("\nWarning: Please draw a valid polygon first (minimum 3 points).")
         return
 
-    is_ok = ask_confirmation(len(verts))
+    if selected_polygon is not None:
+        outer_path = Path(np.vstack((selected_polygon, selected_polygon[0])))
+        hole_path = Path(np.vstack((verts, verts[0])))
+        if not outer_path.contains_points(verts).all() or outer_path.intersects_path(
+            hole_path, filled=False
+        ):
+            print("\nHole must lie completely inside the survey boundary. Redraw it.")
+            return
 
-    if is_ok:
-        selected_polygon = np.array(verts)
-        np.save(output_polygon_file, selected_polygon)
-        print(f"\nPolygon confirmed and saved to: {output_polygon_file}")
-        print(f"Total vertices: {len(selected_polygon)}")
-        plt.close(fig)
-    else:
+    if not ask_confirmation(len(verts)):
         print("\nSelection rejected. You can continue editing.")
+        return
+
+    if selected_polygon is None:
+        selected_polygon = verts.copy()
+        color = "red"
+        ax.set_title(
+            "Draw a hole inside the survey, or click Finish Masks\n"
+            "Confirm each hole with Enter; Backspace removes the last confirmed polygon",
+            fontsize=11
+        )
+        print("\nSurvey boundary confirmed. Draw any holes, or click Finish Masks.")
+    else:
+        hole_polygons.append(verts.copy())
+        color = "orange"
+        print(f"\nHole {len(hole_polygons)} confirmed. Draw another, or click Finish Masks.")
+
+    closed = np.vstack((verts, verts[0]))
+    line, = ax.plot(closed[:, 0], closed[:, 1], color=color, linewidth=2)
+    fill = ax.fill(verts[:, 0], verts[:, 1], color=color, alpha=0.15)[0]
+    confirmed_artists.append((line, fill))
+    selector.clear()
+    fig.canvas.draw_idle()
+
+
+def undo_last(event=None):
+    global selected_polygon
+    if not confirmed_artists:
+        print("\nNo confirmed polygon to undo.")
+        return
+    for artist in confirmed_artists.pop():
+        artist.remove()
+    if hole_polygons:
+        hole_polygons.pop()
+        print("\nLast hole removed.")
+    else:
+        selected_polygon = None
+        ax.set_title(
+            "Draw the survey boundary; click the first point to close it\n"
+            "Enter: confirm | Esc: redraw | Backspace: undo | Finish Masks: save",
+            fontsize=11
+        )
+        print("\nSurvey boundary removed. Draw it again.")
+    fig.canvas.draw_idle()
+
+
+def finish(event=None):
+    global masks_saved
+    if selected_polygon is None:
+        print("\nConfirm the survey boundary before finishing.")
+        return
+    if selector.verts:
+        print("\nConfirm or reset the current hole before finishing.")
+        return
+    np.save(output_polygon_file, selected_polygon)
+    np.savez(output_holes_file, **{
+        f"hole_{i}": polygon for i, polygon in enumerate(hole_polygons, 1)
+    })
+    print(f"\nSurvey boundary saved to: {output_polygon_file}")
+    print(f"{len(hole_polygons)} hole(s) saved to: {output_holes_file}")
+    masks_saved = True
+    plt.close(fig)
 
 def reset(event=None):
     selector.clear()
@@ -173,23 +243,32 @@ def on_key(event):
         confirm()
     elif event.key in ['escape', 'r']:
         reset()
+    elif event.key == 'backspace':
+        undo_last()
 
 fig.canvas.mpl_connect('key_press_event', on_key)
 
 # Bottom UI buttons
-ax_reset = fig.add_axes([0.62, 0.05, 0.15, 0.06])
-ax_confirm = fig.add_axes([0.79, 0.05, 0.18, 0.06])
+ax_reset = fig.add_axes([0.27, 0.05, 0.16, 0.06])
+ax_undo = fig.add_axes([0.45, 0.05, 0.15, 0.06])
+ax_confirm = fig.add_axes([0.62, 0.05, 0.16, 0.06])
+ax_finish = fig.add_axes([0.80, 0.05, 0.18, 0.06])
 
 btn_reset = Button(ax_reset, 'Reset / Redraw', color='#f0f0f0', hovercolor='#ffcccc')
+btn_undo = Button(ax_undo, 'Undo Last', color='#f0f0f0', hovercolor='#ffcccc')
 btn_confirm = Button(ax_confirm, 'Confirm Polygon', color='#d4edda', hovercolor='#a3d9a5')
+btn_finish = Button(ax_finish, 'Finish Masks', color='#d4edda', hovercolor='#a3d9a5')
 
 btn_reset.on_clicked(reset)
+btn_undo.on_clicked(undo_last)
 btn_confirm.on_clicked(confirm)
+btn_finish.on_clicked(finish)
 
 plt.show()
 
 # -------------------------------------------------------------
 # 7. Next Steps
 # -------------------------------------------------------------
-if selected_polygon is not None:
+if masks_saved:
     print(f"\nSaved Polygon coordinates shape: {selected_polygon.shape}")
+    print(f"Confirmed holes: {len(hole_polygons)}")

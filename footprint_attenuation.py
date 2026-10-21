@@ -1,10 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
+from pathlib import Path as FilePath
 from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 from scipy.ndimage import uniform_filter
 from numpy.lib.stride_tricks import sliding_window_view
-import sys
+import re
 
 def load_seismic_colormap(cmap_path, name="custom_seismic", smooth=True):
     valid_rows = []
@@ -48,7 +49,8 @@ def load_seismic_colormap(cmap_path, name="custom_seismic", smooth=True):
 # -------------------------------------------------------------
 # 1. Modular Filtering Helpers
 # -------------------------------------------------------------
-def alpha_trimmed_mean_1d(arr, axis, win_size, alpha=0.2, chunk_size=500):
+def alpha_trimmed_mean_1d(arr, axis, win_size, alpha=0.2, chunk_size=500,
+                          valid_mask=None):
     """
     Applies a 1D alpha-trimmed mean along axis 0 (inline) or axis 1 (crossline).
     """
@@ -64,25 +66,53 @@ def alpha_trimmed_mean_1d(arr, axis, win_size, alpha=0.2, chunk_size=500):
 
     data = np.ascontiguousarray(arr.T) if axis == 0 else np.ascontiguousarray(arr)
     nrows, ncols = data.shape
-    out = np.empty_like(data)
+    out = np.empty_like(data) if valid_mask is None else np.full_like(data, np.nan)
 
     padded = np.pad(data, ((0, 0), (pad_w, pad_w)), mode="edge")
+    valid = None
+    if valid_mask is not None:
+        if valid_mask.shape != arr.shape:
+            raise ValueError("valid_mask must have the same shape as the input array")
+        valid = np.ascontiguousarray(valid_mask.T) if axis == 0 else np.asarray(valid_mask)
+        full_rows = np.all(valid, axis=1)
 
     for r_start in range(0, nrows, chunk_size):
         r_end = min(r_start + chunk_size, nrows)
-        chunk = padded[r_start:r_end, :]
-        windows = sliding_window_view(chunk, win_size, axis=1)
+        rows = (slice(r_start, r_end) if valid is None else
+                np.flatnonzero(full_rows[r_start:r_end]) + r_start)
+        if valid is not None and len(rows) == 0:
+            continue
+        windows = sliding_window_view(padded[rows, :], win_size, axis=1)
 
         if n_trim > 0:
             sorted_win = np.sort(windows, axis=-1)
-            out[r_start:r_end, :] = np.mean(sorted_win[..., n_trim : win_size - n_trim], axis=-1)
+            out[rows, :] = np.mean(sorted_win[..., n_trim : win_size - n_trim], axis=-1)
         else:
-            out[r_start:r_end, :] = np.mean(windows, axis=-1)
+            out[rows, :] = np.mean(windows, axis=-1)
+
+    if valid is not None:
+        # Filter each contiguous valid section separately. No filter window can
+        # use samples from a hole or bridge the two sides of a hole.
+        for row in np.flatnonzero(~full_rows):
+            edges = np.diff(np.r_[False, valid[row], False].astype(np.int8))
+            starts = np.flatnonzero(edges == 1)
+            ends = np.flatnonzero(edges == -1)
+            for start, end in zip(starts, ends):
+                section = np.pad(data[row, start:end], (pad_w, pad_w), mode="edge")
+                windows = sliding_window_view(section, win_size)
+                if n_trim > 0:
+                    sorted_win = np.sort(windows, axis=-1)
+                    out[row, start:end] = np.mean(
+                        sorted_win[:, n_trim : win_size - n_trim], axis=-1
+                    )
+                else:
+                    out[row, start:end] = np.mean(windows, axis=-1)
 
     return np.ascontiguousarray(out.T) if axis == 0 else out
 
 
-def run_alpha_trim_pipeline(data, pipeline_steps, inc_il, inc_xl):
+def run_alpha_trim_pipeline(data, pipeline_steps, inc_il, inc_xl,
+                            valid_mask=None):
     """
     Executes a sequential chain of 1D alpha-trim filters.
     pipeline_steps: list of tuples -> [('inline'|'crossline', window_meters, alpha), ...]
@@ -96,195 +126,471 @@ def run_alpha_trim_pipeline(data, pipeline_steps, inc_il, inc_xl):
             win_samples += 1
 
         print(f" -> Running {direction.upper()} filter: {win_samples} samples ({win_m:.0f}m), alpha={alpha}")
-        result = alpha_trimmed_mean_1d(result, axis=axis, win_size=win_samples, alpha=alpha)
+        result = alpha_trimmed_mean_1d(
+            result, axis=axis, win_size=win_samples, alpha=alpha,
+            valid_mask=valid_mask
+        )
     return result
 
 
 # -------------------------------------------------------------
-# 2. File Paths & Pipeline Parameters
+def validate_pass(parameters):
+    if len(parameters) != 4:
+        raise ValueError("Pass must be (f1, f2, f3, a1)")
+    f1, f2, f3, a1 = (float(value) for value in parameters)
+    if not np.all(np.isfinite((f1, f2, f3, a1))):
+        raise ValueError("Pass parameters must be finite")
+    if f1 <= 0 or f2 <= 0 or f3 <= f2 or a1 < 0:
+        raise ValueError("Require f1 > 0, f2 > 0, f3 > f2, and a1 >= 0")
+    return f1, f2, f3, a1
+
+
+def parse_rms_map_entry(entry):
+    """Accept (path, (lower, upper)) and older (path, lower, upper) entries."""
+    if len(entry) == 2:
+        filename, window = entry
+        if window is None:
+            return filename, None, None
+        if len(window) != 2:
+            raise ValueError("Each RMS window must be a (lower, upper) tuple")
+        return filename, *window
+    if len(entry) == 3:
+        return entry
+    raise ValueError("RMS maps must be (path, (lower, upper)) or (path, None)")
+
+
+def load_horizon_grid(ilines, crosslines):
+    """Interpolate the configured ASCII horizon onto the RMS map grid."""
+    from create_rms_map import read_horizon, interpolate_horizon, z_scale
+
+    points, z = read_horizon(
+        horizon_file, delimiter=horizon_delimiter, columns=horizon_columns,
+        fixed_widths=horizon_fixed_widths, skip_rows=horizon_skip_rows,
+        missing_values=horizon_missing_values, decimal=horizon_decimal,
+        encoding=horizon_encoding,
+    )
+    grid_il, grid_xl = np.meshgrid(ilines, crosslines, indexing="ij")
+    surface = interpolate_horizon(points, z, grid_il.ravel(), grid_xl.ravel())
+    surface = surface.reshape(grid_il.shape)
+    if not np.any(np.isfinite(surface)):
+        raise ValueError("The horizon does not cover any RMS map positions")
+    return surface, z_scale(horizon_z_unit, vertical_domain)
+
+
+def read_window_bounds(map_file, top, bottom, ilines, crosslines,
+                       horizon_grid=None, horizon_scale=1.0):
+    shape = (len(ilines), len(crosslines))
+    if top is not None or bottom is not None:
+        if top is None or bottom is None or not np.isfinite(top) or not np.isfinite(bottom) or top >= bottom:
+            raise ValueError(f"{map_file}: provide both valid top and bottom Z values")
+        if rms_window_mode == "absolute":
+            return np.full(shape, top, dtype=np.float32), np.full(shape, bottom, dtype=np.float32)
+        if horizon_grid is None:
+            raise ValueError("Horizon-relative windows require horizon_file")
+        top_grid = ((horizon_grid + top) * horizon_scale).astype(np.float32)
+        bottom_grid = ((horizon_grid + bottom) * horizon_scale).astype(np.float32)
+        sidecar = map_file.with_name(map_file.stem + "_window.npz")
+        if sidecar.exists():
+            stored_top, stored_bottom = read_window_bounds(
+                map_file, None, None, ilines, crosslines
+            )
+            known = np.isfinite(stored_top) & np.isfinite(stored_bottom)
+            if (not np.allclose(top_grid[known], stored_top[known], atol=0.01) or
+                    not np.allclose(bottom_grid[known], stored_bottom[known], atol=0.01)):
+                raise ValueError(f"{map_file}: horizon offsets disagree with {sidecar}")
+        return top_grid, bottom_grid
+
+    sidecar = map_file.with_name(map_file.stem + "_window.npz")
+    if not sidecar.exists():
+        raise FileNotFoundError(f"{sidecar}: window bounds required for vertical interpolation")
+    with np.load(sidecar, allow_pickle=False) as data:
+        if not np.array_equal(data["inlines"], ilines) or not np.array_equal(data["crosslines"], crosslines):
+            raise ValueError(f"{sidecar}: coordinate axes differ from the RMS maps")
+        if str(data["vertical_domain"]) != vertical_domain:
+            raise ValueError(f"{sidecar}: vertical domain differs from configuration")
+        expected_unit = "ms" if vertical_domain == "time" else "m"
+        if str(data["z_unit"]) != expected_unit:
+            raise ValueError(f"{sidecar}: expected vertical unit {expected_unit}")
+        top_grid = np.asarray(data["top_z"], dtype=np.float32)
+        bottom_grid = np.asarray(data["bottom_z"], dtype=np.float32)
+    if top_grid.shape != shape or bottom_grid.shape != shape:
+        raise ValueError(f"{sidecar}: window arrays do not match the RMS grid")
+    valid = np.isfinite(top_grid) & np.isfinite(bottom_grid)
+    if not np.any(valid):
+        raise ValueError(f"{sidecar}: no finite window bounds found")
+    if np.any(top_grid[valid] >= bottom_grid[valid]):
+        raise ValueError(f"{sidecar}: some window tops are below their bottoms")
+    return top_grid, bottom_grid
+
+
+def load_holes(polygon_path):
+    holes_file = polygon_path.with_name(polygon_path.stem + "_holes.npz")
+    if not holes_file.exists():
+        return []  # Existing single-polygon masks remain usable.
+    with np.load(holes_file, allow_pickle=False) as saved:
+        return [np.asarray(saved[key], dtype=float) for key in sorted(saved.files)]
+
+
+def prepare_input(rms_map, ilines, crosslines, polygon, holes):
+    if rms_map.shape != (len(ilines), len(crosslines)):
+        raise ValueError("RMS map shape does not match the inline/crossline axes")
+    if not np.any(np.isfinite(rms_map)):
+        raise ValueError("RMS map contains no finite samples")
+    n_pad_il = int(np.round(pad_inline_meters / inline_increment))
+    n_pad_xl = int(np.round(pad_crossline_meters / crossline_increment))
+    p1, p99 = np.nanpercentile(rms_map, [1.0, 99.0])
+    clipped = np.nan_to_num(np.clip(rms_map, p1, p99), nan=0.0)
+    padded = np.pad(clipped, ((n_pad_il, n_pad_il), (n_pad_xl, n_pad_xl)),
+                    mode="constant", constant_values=0.0)
+
+    il_step = np.median(np.diff(ilines)) if len(ilines) > 1 else 1.0
+    xl_step = np.median(np.diff(crosslines)) if len(crosslines) > 1 else 1.0
+    padded_il = np.r_[ilines[0] - np.arange(n_pad_il, 0, -1) * il_step,
+                      ilines,
+                      ilines[-1] + np.arange(1, n_pad_il + 1) * il_step]
+    padded_xl = np.r_[crosslines[0] - np.arange(n_pad_xl, 0, -1) * xl_step,
+                      crosslines,
+                      crosslines[-1] + np.arange(1, n_pad_xl + 1) * xl_step]
+    XL, IL = np.meshgrid(padded_xl, padded_il)
+    points = np.column_stack((XL.ravel(), IL.ravel()))
+    outer_grid = Path(polygon).contains_points(points).reshape(padded.shape)
+    hole_grid = np.zeros(padded.shape, dtype=bool)
+    for hole in holes:
+        hole_grid |= Path(hole).contains_points(points, radius=1e-9).reshape(padded.shape)
+    mask_grid = outer_grid & ~hole_grid
+
+    win_il = max(1, int(np.round(filter_il_meters / inline_increment)) | 1)
+    win_xl = max(1, int(np.round(filter_xl_meters / crossline_increment)) | 1)
+    smooth = uniform_filter(mask_grid.astype(np.float32), size=(win_il, win_xl), mode="nearest")
+    smooth = np.clip(smooth, 0.0, 1.0)
+    smooth[smooth < 1.0] = 0.0
+    smooth = uniform_filter(smooth, size=(win_il, win_xl), mode="nearest")
+
+    inside = padded[mask_grid & (padded > 0)]
+    if inside.size == 0:
+        raise ValueError("No positive RMS samples remain inside the survey after excluding holes")
+    median = float(np.median(inside))
+    blended = padded * smooth + (1.0 - smooth) * median
+    blended[hole_grid] = np.nan
+    core = (slice(n_pad_il, n_pad_il + len(ilines)),
+            slice(n_pad_xl, n_pad_xl + len(crosslines)))
+    return {
+        "input": blended, "outer": outer_grid, "holes": hole_grid,
+        "valid_filter": ~hole_grid if holes else None, "core": core,
+        "extent": [padded_xl.min(), padded_xl.max(), padded_il.min(), padded_il.max()],
+        "median": median,
+    }
+
+
+def run_pass(input_map, parameters, valid_filter):
+    f1, f2, f3, a1 = validate_pass(parameters)
+    inline_steps = [("inline", f1, alpha)] * 2
+    short_steps = [("crossline", f2, alpha)] * 2
+    long_steps = [("crossline", f3, alpha)] * 2
+
+    inline_filtered = run_alpha_trim_pipeline(
+        input_map, inline_steps, inline_increment, crossline_increment, valid_filter
+    )
+    difference = inline_filtered - input_map
+    short_difference = run_alpha_trim_pipeline(
+        difference, short_steps, inline_increment, crossline_increment, valid_filter
+    )
+    threshold = a1 * np.nanstd(short_difference)
+    large_difference = np.abs(difference) > threshold
+    long_difference = run_alpha_trim_pipeline(
+        difference, long_steps, inline_increment, crossline_increment, valid_filter
+    )
+    selected_difference = np.where(large_difference, long_difference, difference)
+    filtered_difference = run_alpha_trim_pipeline(
+        selected_difference, short_steps, inline_increment, crossline_increment,
+        valid_filter
+    )
+    result = input_map + filtered_difference
+    coefficient = np.ones_like(result, dtype=np.float32)
+    np.divide(result, input_map, out=coefficient,
+              where=np.isfinite(input_map) & (np.abs(input_map) > 1e-12))
+    if valid_filter is not None:
+        coefficient[~valid_filter] = np.nan
+    filtered_coefficient = run_alpha_trim_pipeline(
+        coefficient, short_steps, inline_increment, crossline_increment, valid_filter
+    )
+    output = input_map * filtered_coefficient
+    return {
+        "difference": difference, "short_difference": short_difference,
+        "long_difference": long_difference, "filtered_difference": filtered_difference,
+        "coefficient": coefficient, "filtered_coefficient": filtered_coefficient,
+        "output": output, "threshold": threshold,
+    }
+
+
+def show_pass(map_file, number, parameters, input_map, result, extent, cmap):
+    arrays = [input_map, result["difference"], result["short_difference"],
+              result["long_difference"], result["filtered_difference"],
+              result["coefficient"], result["filtered_coefficient"], result["output"]]
+    titles = ["Input blended RMS", "Inline difference", "Short crossline difference",
+              "Long crossline difference", "Selected/filtered difference",
+              "Raw coefficient", "Filtered coefficient", "Output blended RMS"]
+    diff_scale = np.nanpercentile(np.abs(result["difference"]), 97)
+    amplitude_scale = np.nanpercentile(np.r_[input_map.ravel(), result["output"].ravel()], 99.9)
+    fig, axes = plt.subplots(2, 4, figsize=(22, 12), sharex=True, sharey=True)
+    for ax, array, title in zip(axes.ravel(), arrays, titles):
+        if "difference" in title.lower():
+            kwargs = {"cmap": "bwr", "vmin": -diff_scale, "vmax": diff_scale}
+        elif "coefficient" in title.lower():
+            kwargs = {"cmap": "bwr", "vmin": 0.5, "vmax": 1.5}
+        else:
+            kwargs = {"cmap": cmap, "vmin": 0, "vmax": amplitude_scale}
+        image = ax.imshow(array, origin="lower", aspect="equal", extent=extent, **kwargs)
+        ax.set_title(title)
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.suptitle(f"{map_file.name}: pass {number}, {parameters}, threshold={result['threshold']:.3g}")
+    fig.tight_layout()
+    plt.show(block=True)
+    plt.close(fig)
+
+
+def parse_pass_input(raw, default):
+    if not raw.strip():
+        if default is None:
+            raise ValueError("Enter f1, f2, f3, a1")
+        return validate_pass(default)
+    fields = re.split(r"[,;\s]+", raw.strip().strip("()"))
+    return validate_pass(fields)
+
+
+def select_passes(map_file, prepared, cmap):
+    current = prepared["input"]
+    cumulative = np.ones_like(current, dtype=np.float32)
+    if prepared["valid_filter"] is not None:
+        cumulative[~prepared["valid_filter"]] = np.nan
+    accepted = []
+    suggestion = 0
+    while True:
+        if parameter_input_mode == "interactive":
+            default = pass_parameters[suggestion] if suggestion < len(pass_parameters) else None
+            label = f"{default}" if default is not None else "f1,f2,f3,a1"
+            raw = input(f"{map_file.name} pass {len(accepted)+1} [{label}; 'done' to finish]: ").strip()
+            if raw.lower() in ("done", "stop"):
+                if not accepted:
+                    print("Accept at least one pass before finishing this RMS map.")
+                    continue
+                break
+            try:
+                parameters = parse_pass_input(raw, default)
+            except ValueError as exc:
+                print(exc)
+                continue
+        else:
+            if suggestion >= len(pass_parameters):
+                break
+            parameters = validate_pass(pass_parameters[suggestion])
+
+        result = run_pass(current, parameters, prepared["valid_filter"])
+        if parameter_input_mode == "interactive":
+            show_pass(map_file, len(accepted)+1, parameters, current, result,
+                      prepared["extent"], cmap)
+            while True:
+                choice = input("Accept and [n]ext pass, accept and [f]inish map, [r]etry, or [s]top without this pass? [f]: ").strip().lower() or "f"
+                if choice in ("n", "f", "r", "s"):
+                    break
+                print("Choose n, f, r, or s.")
+            if choice == "r":
+                continue
+            if choice == "s":
+                if not accepted:
+                    print("Accept at least one pass before finishing this RMS map.")
+                    continue
+                break
+        else:
+            if preview_hardcoded_passes:
+                show_pass(map_file, len(accepted)+1, parameters, current, result,
+                          prepared["extent"], cmap)
+            choice = "n"
+
+        current = result["output"]
+        cumulative *= result["filtered_coefficient"]
+        accepted.append(parameters)
+        if save_pass_differences:
+            stem = map_file.with_suffix("")
+            np.save(f"{stem}_pass_{len(accepted)}_diff_short.npy", result["short_difference"])
+            np.save(f"{stem}_pass_{len(accepted)}_diff_long.npy", result["long_difference"])
+        if choice == "f":
+            break
+        suggestion += 1
+
+    if not accepted:
+        raise ValueError("pass_parameters must contain at least one tuple")
+    return cumulative, current, accepted
+
+
+def interpolate_trace_coefficients(z_samples, top_z, bottom_z, coefficients):
+    """Interpolate accepted map coefficients at one trace's vertical samples.
+
+    Returns 1 outside the outer window bounds and for missing/holed picks.
+    Within the bounds, values vary linearly through window centers and taper
+    continuously to 1 at the first top and last bottom.
+    """
+    z_samples = np.asarray(z_samples, dtype=float)
+    tops = np.asarray(top_z, dtype=float)
+    bottoms = np.asarray(bottom_z, dtype=float)
+    values = np.asarray(coefficients, dtype=float)
+    valid = np.isfinite(tops) & np.isfinite(bottoms) & np.isfinite(values)
+    out = np.ones_like(z_samples, dtype=np.float32)
+    if not np.any(valid):
+        return out
+    centers = (tops[valid] + bottoms[valid]) / 2
+    order = np.argsort(centers)
+    centers = centers[order]
+    values = values[valid][order]
+    if len(centers) > 1 and np.any(np.diff(centers) <= 0):
+        raise ValueError("Window centers must increase at each trace")
+    start = np.min(tops[valid])
+    end = np.max(bottoms[valid])
+    knots = np.r_[start, centers, end]
+    knot_values = np.r_[1.0, values, 1.0]
+    inside = np.isfinite(z_samples) & (z_samples >= start) & (z_samples <= end)
+    out[inside] = np.interp(z_samples[inside], knots, knot_values)
+    return out
+
+
+def main():
+    if not rms_maps:
+        raise ValueError("Configure at least one RMS map in rms_maps")
+    if vertical_domain not in ("time", "depth"):
+        raise ValueError("vertical_domain must be 'time' or 'depth'")
+    if rms_window_mode not in ("absolute", "horizon"):
+        raise ValueError("rms_window_mode must be 'absolute' or 'horizon'")
+    if inline_increment <= 0 or crossline_increment <= 0:
+        raise ValueError("Inline and crossline increments must be positive")
+    if parameter_input_mode not in ("interactive", "hardcoded"):
+        raise ValueError("parameter_input_mode must be 'interactive' or 'hardcoded'")
+    if parameter_input_mode == "hardcoded" and not pass_parameters:
+        raise ValueError("Configure at least one tuple in pass_parameters for hardcoded mode")
+    ilines = np.load(il_file)
+    crosslines = np.load(xl_file)
+    polygon_path = FilePath(polygon_file)
+    polygon = np.load(polygon_path)
+    holes = load_holes(polygon_path)
+    needs_plot = parameter_input_mode == "interactive" or preview_hardcoded_passes
+    cmap = load_seismic_colormap(colormap_file, smooth=True) if needs_plot else None
+    print(f"Using {len(holes)} excluded hole(s)")
+
+    # Check all vertical knots and map dimensions before starting any passes.
+    map_entries = [parse_rms_map_entry(entry) for entry in rms_maps]
+    horizon_grid = None
+    horizon_scale = 1.0
+    if rms_window_mode == "horizon" and any(top is not None for _, top, _ in map_entries):
+        horizon_grid, horizon_scale = load_horizon_grid(ilines, crosslines)
+    specifications = []
+    for filename, top, bottom in map_entries:
+        map_file = FilePath(filename)
+        top_grid, bottom_grid = read_window_bounds(
+            map_file, top, bottom, ilines, crosslines, horizon_grid, horizon_scale
+        )
+        rms_shape = np.load(map_file, mmap_mode="r").shape
+        if rms_shape != (len(ilines), len(crosslines)):
+            raise ValueError(f"{map_file}: map shape does not match the coordinate axes")
+        specifications.append((map_file, top_grid, bottom_grid))
+    specifications.sort(key=lambda spec: np.nanmedian((spec[1] + spec[2]) / 2))
+    for previous, following in zip(specifications, specifications[1:]):
+        before = (previous[1] + previous[2]) / 2
+        after = (following[1] + following[2]) / 2
+        valid = np.isfinite(before) & np.isfinite(after)
+        if np.any(after[valid] <= before[valid]):
+            raise ValueError("RMS window centers overlap or change order on the survey grid")
+
+    completed = []
+    for map_file, top_grid, bottom_grid in specifications:
+        rms = np.load(map_file)
+        finite_window = np.isfinite(top_grid) & np.isfinite(bottom_grid)
+        if np.any(np.isfinite(rms) & ~finite_window):
+            raise ValueError(f"{map_file}: finite RMS samples lack vertical window bounds")
+        prepared = prepare_input(rms, ilines, crosslines, polygon, holes)
+        print(f"\nProcessing {map_file.name}")
+        coefficients, _, accepted = select_passes(map_file, prepared, cmap)
+        core = prepared["core"]
+        coeff_grid = coefficients[core].copy()
+        coeff_grid[~prepared["outer"][core]] = 1.0
+        coeff_grid[prepared["holes"][core]] = np.nan
+        coeff_grid[~np.isfinite(rms) & ~prepared["holes"][core]] = 1.0
+        corrected_rms = rms * coeff_grid
+        coefficient_file = map_file.with_name(map_file.stem + "_coeff.npy")
+        corrected_file = map_file.with_name(map_file.stem + "_corrected.npy")
+        np.save(coefficient_file, coeff_grid)
+        np.save(corrected_file, corrected_rms)
+        print(f"Saved {coefficient_file} and {corrected_file}")
+        completed.append((map_file, coeff_grid, top_grid, bottom_grid, accepted))
+
+    coefficient_stack = np.stack([entry[1] for entry in completed])
+    top_stack = np.stack([entry[2] for entry in completed])
+    bottom_stack = np.stack([entry[3] for entry in completed])
+    import json
+    np.savez_compressed(
+        output_bundle_file, coefficients=coefficient_stack, top_z=top_stack,
+        bottom_z=bottom_stack, inlines=ilines, crosslines=crosslines,
+        vertical_domain=vertical_domain,
+        z_unit="ms" if vertical_domain == "time" else "m",
+        rms_files=np.asarray([str(entry[0]) for entry in completed]),
+        passes_json=json.dumps([entry[4] for entry in completed]),
+        interpolation="linear_at_window_centers_taper_to_one_at_outer_bounds",
+    )
+    print(f"Saved vertical interpolation bundle: {output_bundle_file}")
+    print("Apply coefficients at SEG-Y samples by interpolating through each trace's window centers.")
+
+
+# User configuration: edit these values before running
 # -------------------------------------------------------------
-rms_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/KDM_NorthPolygon_RMS.npy"
+# "absolute": each (lower, upper) tuple is a fixed interval in ms or m.
+# "horizon": each tuple is an offset from the horizon in horizon_z_unit.
+# The maps are processed in vertical order, even if listed out of order.
+rms_window_mode = "absolute"  # change to "horizon" for horizon-relative windows
+# (RMS map, (lower, upper)). Use (RMS map, None) to read the map's
+# *_window.npz sidecar instead. Older (map, lower, upper) entries also work.
+rms_maps = [
+    ("/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/KDM_NorthPolygon_RMS.npy", (0.0, 1000.0)),
+    # For rms_window_mode="horizon", replace the entries above with:
+    # ("/path/to/RMS_horizon_1_0_1400ms.npy", (0.0, 1400.0)),
+    # ("/path/to/RMS_horizon_2_1400_2800ms.npy", (1400.0, 2800.0)),
+]
+horizon_file = "/path/to/horizon.txt"  # required with horizon-relative tuples
+horizon_z_unit = "ms"  # "ms" or "s" for time; "m" or "ft" for depth
+# Match the ASCII layout settings used for this file in create_rms_map.py.
+horizon_delimiter = "auto"
+horizon_columns = "auto"  # or (inline_column, crossline_column, z_column), zero-based
+horizon_fixed_widths = None
+horizon_skip_rows = 0
+horizon_missing_values = ("NaN")
+horizon_decimal = "."
+horizon_encoding = "utf-8-sig"
 il_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/KDM_NorthPolygon_Inlines.npy"
 xl_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/KDM_NorthPolygon_Crosslines.npy"
 polygon_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/selected_polygon.npy"
-
-output_diff_4k_npy = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/KDM_NorthPolygon_RMS_Diff_4k.npy"
-output_diff_16k_npy = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/KDM_NorthPolygon_RMS_Diff_16k.npy"
-
+output_bundle_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/seiTimeProc/test/QC/9999_SEGY_OUT_2/100sei/9999_SEGY_OUT_2/destriping_coefficients.npz"
 colormap_file = "/data/h8/dug/brazil/teamipanema/total/brazilMPFW_100/ScientificColourMaps8/oslo/oslo.alut"
 
+vertical_domain = "time"  # time: ms; depth: m. Must match the RMS map windows.
 inline_increment = 25.0
 crossline_increment = 25.0
-
 pad_inline_meters = 3000.0
 pad_crossline_meters = 200.0
+filter_il_meters = 2000.0  # polygon blending aperture
+filter_xl_meters = 2000.0
+alpha = 0.3  # same alpha-trim value used by the previous script
 
-# Mask smoothing
-filter_il_meters = 1000.0
-filter_xl_meters = 1000.0
-
-# -------------------------------------------------------------
-# Easily Change Pipeline Steps Here: ('direction', window_meters, alpha)
-# -------------------------------------------------------------
-# Pass 1: Extract Inline structural trend
-pipeline_inline = [
-    ("inline", 1000.0, 0.3),
-    ("inline", 1000.0, 0.3),
+# Choose how pass tuples are supplied:
+#   "interactive": type/review one tuple at a time; values below are suggestions.
+#   "hardcoded": run every tuple below in order for every RMS map, without prompts.
+parameter_input_mode = "interactive"  # change to "hardcoded" for batch processing
+# Each tuple is (inline length, short crossline length, long crossline length,
+# standard-deviation multiplier). Filter lengths are in metres.
+pass_parameters = [
+    (1000.0, 4000.0, 16000.0, 2.0),
+    # (800.0, 3000.0, 12000.0, 1.5),
+    # (600.0, 2000.0, 8000.0, 1.0),
 ]
 
-# Pass 2A: Crossline footprint filter (4,000 m aperture)
-pipeline_xl_4k = [
-    ("crossline", 4000.0, 0.3),
-    ("crossline", 4000.0, 0.3),
-]
+preview_hardcoded_passes = False  # display each QC plot in hardcoded mode
+save_pass_differences = False  # accepted passes only, one file per aperture
 
-# Pass 2B: Crossline footprint filter (16,000 m aperture)
-pipeline_xl_16k = [
-    ("crossline", 16000.0, 0.3),
-    ("crossline", 16000.0, 0.3),
-]
-
-# -------------------------------------------------------------
-# 3. Load Arrays & Build Coordinates
-# -------------------------------------------------------------
-n_pad_il = int(np.round(pad_inline_meters / inline_increment))
-n_pad_xl = int(np.round(pad_crossline_meters / crossline_increment))
-
-rms_map = np.load(rms_file)
-il_unique = np.load(il_file)
-xl_unique = np.load(xl_file)
-polygon = np.load(polygon_file)
-
-p1, p99 = np.nanpercentile(rms_map, [1.0, 99.0])
-clipped_map = np.clip(rms_map, p1, p99)
-clipped_map = np.nan_to_num(clipped_map, nan=0.0)
-
-padded_rms = np.pad(clipped_map, pad_width=((n_pad_il, n_pad_il), (n_pad_xl, n_pad_xl)),mode="constant",constant_values=0.0)
-
-il_step = np.median(np.diff(il_unique)) if len(il_unique) > 1 else 1.0
-xl_step = np.median(np.diff(xl_unique)) if len(xl_unique) > 1 else 1.0
-
-pad_il_before = il_unique[0] - np.arange(n_pad_il, 0, -1) * il_step
-pad_il_after = il_unique[-1] + np.arange(1, n_pad_il + 1) * il_step
-padded_il = np.concatenate([pad_il_before, il_unique, pad_il_after])
-
-pad_xl_before = xl_unique[0] - np.arange(n_pad_xl, 0, -1) * xl_step
-pad_xl_after = xl_unique[-1] + np.arange(1, n_pad_xl + 1) * xl_step
-padded_xl = np.concatenate([pad_xl_before, xl_unique, pad_xl_after])
-
-extent = [padded_xl.min(), padded_xl.max(), padded_il.min(), padded_il.max()]
-
-# -------------------------------------------------------------
-# 4. Mask Generation & Blending
-# -------------------------------------------------------------
-XL, IL = np.meshgrid(padded_xl, padded_il)
-points = np.column_stack((XL.ravel(), IL.ravel()))
-
-poly_path = Path(polygon)
-mask_grid = poly_path.contains_points(points).reshape(padded_rms.shape).astype(np.float32)
-
-win_il = int(np.round(filter_il_meters / inline_increment)) | 1
-win_xl = int(np.round(filter_xl_meters / crossline_increment)) | 1
-
-smoothed_mask = uniform_filter(mask_grid, size=(win_il, win_xl), mode="nearest")
-smoothed_mask = np.clip(smoothed_mask, 0.0, 1.0)
-smoothed_mask[smoothed_mask < 1.0] = 0.0
-smoothed_mask = uniform_filter(smoothed_mask, size=(win_il, win_xl), mode="nearest")
-
-inside_values = padded_rms[(mask_grid == 1.0) & (padded_rms > 0.0)]
-if inside_values.size == 0:
-    inside_values = padded_rms[padded_rms > 0.0]
-median_val = float(np.median(inside_values))
-
-blended_rms = padded_rms * smoothed_mask + (1.0 - smoothed_mask) * median_val
-
-# -------------------------------------------------------------
-# 5. Filtering Execution
-# -------------------------------------------------------------
-# Pass 1: Inline filtering
-print("\n--- Running Inline Filter Pipeline ---")
-inline_filtered = run_alpha_trim_pipeline(blended_rms, pipeline_inline, inline_increment, crossline_increment)
-difference = inline_filtered - blended_rms
-
-# Pass 2A: 4,000m Crossline filtering on difference
-print("\n--- Running Crossline Filter Pipeline (4,000 m) ---")
-diff_xl_4k = run_alpha_trim_pipeline(difference, pipeline_xl_4k, inline_increment, crossline_increment)
-std_4k = np.std(diff_xl_4k)
-mask_diff_4k = np.where(np.abs(difference) > 2.0 * std_4k, 1.0, 0.0)
-restored_4k = blended_rms + diff_xl_4k
-np.save(output_diff_4k_npy, diff_xl_4k)
-
-# Pass 2B: 16,000m Crossline filtering on difference
-print("\n--- Running Crossline Filter Pipeline (16,000 m) ---")
-diff_xl_16k = run_alpha_trim_pipeline(difference, pipeline_xl_16k, inline_increment, crossline_increment)
-std_16k = np.std(diff_xl_16k)
-mask_diff_16k = np.where(np.abs(difference) > 2.0 * std_16k, 1.0, 0.0)
-restored_16k = blended_rms + diff_xl_16k
-np.save(output_diff_16k_npy, diff_xl_16k)
-
-print("\n--- Running Crossline Filter Pipeline (4,000 m) ---")
-diff_prec = mask_diff_4k*diff_xl_16k + (1-mask_diff_4k) * difference
-diff_prec = run_alpha_trim_pipeline(diff_prec, pipeline_xl_4k, inline_increment, crossline_increment)
-
-eps=sys.float_info.min
-result = blended_rms+diff_prec
-
-coeff = (result+eps)/(blended_rms+eps)
-
-coeff_filt = run_alpha_trim_pipeline(coeff, pipeline_xl_4k, inline_increment, crossline_increment)
-
-# -------------------------------------------------------------
-# 6. Reusable QC Plotting Function
-# -------------------------------------------------------------
-my_cmap = load_seismic_colormap(colormap_file, smooth=True)
-blend_vmax = np.percentile(blended_rms, 99.9)
-diff_vmax = np.percentile(np.abs(difference), 97.0)
-
-
-fig, axes = plt.subplots(2, 4, figsize=(22, 12), sharex=True, sharey=True)
-axes = axes.ravel()
-
-# 0. Blended RMS
-im0 = axes[0].imshow(blended_rms, origin="lower", aspect="equal", extent=extent, cmap=my_cmap, vmin=0, vmax=blend_vmax)
-axes[0].set_title(f"Blended RMS (Median: {median_val:.2f})", fontsize=10)
-axes[0].set_ylabel("Inline")
-fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-
-# 1. Raw Inline Difference
-im1 = axes[1].imshow(difference, origin="lower", aspect="equal", extent=extent, cmap="bwr", vmin=-diff_vmax, vmax=diff_vmax)
-axes[1].set_title("Difference: Inline Filtered - Blended", fontsize=10)
-fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-
-# 2. Crossline Filtered Difference
-im2 = axes[2].imshow(diff_xl_4k, origin="lower", aspect="equal", extent=extent, cmap="bwr", vmin=-diff_vmax, vmax=diff_vmax)
-axes[2].set_title(f"Filtered Difference ", fontsize=10)
-fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
-
-# 5. Residual Noise / Footprint Removed
-im5 = axes[3].imshow(diff_prec, origin="lower", aspect="equal", extent=extent, cmap="bwr", vmin=-diff_vmax, vmax=diff_vmax)
-axes[3].set_title("Residual Footprint Removed (Diff - Filtered)", fontsize=10)
-axes[3].set_xlabel("Crossline")
-fig.colorbar(im5, ax=axes[3], fraction=0.046, pad=0.04)
-
-im6 = axes[4].imshow(result, origin="lower", aspect="equal", extent=extent, cmap=my_cmap, vmin=0, vmax=blend_vmax)
-axes[4].set_title(f"Blended RMS (Median: {median_val:.2f})", fontsize=10)
-axes[4].set_ylabel("Inline")
-fig.colorbar(im6, ax=axes[4], fraction=0.046, pad=0.04)
-
-im7 = axes[5].imshow(coeff, origin="lower", aspect="equal", extent=extent, cmap='bwr',vmin=0.5,vmax=1.5)
-axes[5].set_title(f"Blended RMS (Median: {median_val:.2f})", fontsize=10)
-fig.colorbar(im7, ax=axes[5], fraction=0.046, pad=0.04)
-
-im8 = axes[6].imshow(coeff_filt, origin="lower", aspect="equal", extent=extent, cmap='bwr',vmin=0.5,vmax=1.5)
-axes[6].set_title(f"Blended RMS (Median: {median_val:.2f})", fontsize=10)
-fig.colorbar(im8, ax=axes[6], fraction=0.046, pad=0.04)
-
-im9 = axes[7].imshow(blended_rms*coeff_filt, origin="lower", aspect="equal", extent=extent, cmap=my_cmap, vmin=0, vmax=blend_vmax)
-axes[7].set_title(f"", fontsize=10)
-axes[7].set_ylabel("Inline")
-fig.colorbar(im0, ax=axes[7], fraction=0.046, pad=0.04)
-
-fig.suptitle(f"QC Dashboard", fontsize=14, weight="bold")
-plt.tight_layout()
-
-plt.show()
+if __name__ == "__main__":
+    main()
