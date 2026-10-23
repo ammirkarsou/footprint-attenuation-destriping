@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 import segyio
 
-from coefficient_interpolation import interpolate_trace_coefficients
+from coefficient_interpolation import apply_coefficients_chunk
+from create_rms_map import optimal_trace_chunk
 
 
 def load_coefficient_bundle(path):
@@ -21,6 +22,8 @@ def load_coefficient_bundle(path):
         if missing:
             raise ValueError(f"Coefficient bundle is missing: {', '.join(sorted(missing))}")
         bundle = {key: saved[key] for key in required}
+        if "valid_masks" in saved.files:
+            bundle["valid_masks"] = saved["valid_masks"]
         has_interval = "sample_interval" in saved.files
         has_start = "sample_start" in saved.files
         if has_interval != has_start:
@@ -38,6 +41,11 @@ def load_coefficient_bundle(path):
         raise ValueError("Coefficient bundle must contain at least one 2D map")
     if top.shape != coefficients.shape or bottom.shape != coefficients.shape:
         raise ValueError("Coefficient and vertical-window arrays have different shapes")
+    if "valid_masks" in bundle and (
+        bundle["valid_masks"].shape != coefficients.shape or
+        bundle["valid_masks"].dtype != np.bool_
+    ):
+        raise ValueError("Coefficient validity masks must be boolean and match the maps")
     if inlines.ndim != 1 or crosslines.ndim != 1 or (
         coefficients.shape[1:] != (len(inlines), len(crosslines))
     ):
@@ -109,6 +117,7 @@ def inspect_input(segy_path, bundle, interval_override, start_override):
         il_headers = segy.attributes(segyio.TraceField.INLINE_3D)[:]
         xl_headers = segy.attributes(segyio.TraceField.CROSSLINE_3D)[:]
         n_samples = segy.samples.size
+        sample_bytes = 8 if int(segy.format) == 6 else 4
 
     inlines = bundle["inlines"]
     crosslines = bundle["crosslines"]
@@ -124,12 +133,12 @@ def inspect_input(segy_path, bundle, interval_override, start_override):
     if len(np.unique(cells)) != count:
         raise ValueError("SEG-Y contains duplicate inline/crossline trace positions")
     samples = start + np.arange(n_samples, dtype=np.float64) * interval
-    return il_index, xl_index, samples
+    return il_index, xl_index, samples, sample_bytes
 
 
 def apply_coefficients(input_path, bundle_path, output_path, *,
                        sample_interval_override=None, sample_start_override=None,
-                       trace_chunk_size=1024, overwrite_output=False):
+                       trace_chunk_size=None, overwrite_output=False):
     """Copy and compensate SEG-Y traces, preserving headers and trace order."""
     source = Path(input_path)
     bundle_file = Path(bundle_path)
@@ -146,14 +155,17 @@ def apply_coefficients(input_path, bundle_path, output_path, *,
         raise FileExistsError(
             f"Output already exists: {target}; change the name or set overwrite_output=True"
         )
-    if not isinstance(trace_chunk_size, int) or trace_chunk_size < 1:
-        raise ValueError("trace_chunk_size must be a positive integer")
-
+    if trace_chunk_size is not None:
+        print("Ignoring trace_chunk_size; chunk size is automatic")
     data = load_coefficient_bundle(bundle_file)
-    il_index, xl_index, z_samples = inspect_input(
+    il_index, xl_index, z_samples, sample_bytes = inspect_input(
         source, data, sample_interval_override, sample_start_override
     )
+    chunk_size = optimal_trace_chunk(
+        len(z_samples), len(il_index), trace_arrays=3, sample_bytes=sample_bytes
+    )
     print(f"Input: {len(il_index)} traces, {len(z_samples)} samples per trace")
+    print(f"Automatically processing {chunk_size} traces per chunk")
     print(f"Bundle: {data['coefficients'].shape[0]} RMS windows, "
           f"{data['vertical_domain'].item()} in {data['z_unit'].item()}")
     print(f"Writing compensated SEG-Y to {target}")
@@ -170,27 +182,22 @@ def apply_coefficients(input_path, bundle_path, output_path, *,
         changed = 0
         with segyio.open(str(temporary), mode="r+", strict=False,
                          ignore_geometry=True) as segy:
-            for first in range(0, len(il_index), trace_chunk_size):
-                last = min(first + trace_chunk_size, len(il_index))
-                traces = segy.trace.raw[first:last]
-                for offset, trace in enumerate(traces):
-                    index = first + offset
-                    il = il_index[index]
-                    xl = xl_index[index]
-                    factors = interpolate_trace_coefficients(
-                        z_samples,
-                        data["top_z"][:, il, xl],
-                        data["bottom_z"][:, il, xl],
-                        data["coefficients"][:, il, xl],
-                    )
-                    if np.all(factors == 1.0):
-                        continue
-                    corrected = trace * factors
-                    if np.any(np.isfinite(trace) & ~np.isfinite(corrected)):
-                        raise ValueError(f"Compensated trace {index} contains overflow")
-                    segy.trace[index] = corrected
-                    changed += 1
-                if last == len(il_index) or (last // trace_chunk_size) % 20 == 0:
+            trace_io = segy.trace.raw
+            for first in range(0, len(il_index), chunk_size):
+                last = min(first + chunk_size, len(il_index))
+                traces = np.ascontiguousarray(trace_io[first:last])
+                corrected, changed_flags, overflow = apply_coefficients_chunk(
+                    traces, il_index[first:last], xl_index[first:last], z_samples,
+                    data["top_z"], data["bottom_z"], data["coefficients"],
+                    data.get("valid_masks"),
+                )
+                bad = np.flatnonzero(overflow)
+                if bad.size:
+                    raise ValueError(f"Compensated trace {first + bad[0]} contains overflow")
+                for offset in np.flatnonzero(changed_flags):
+                    trace_io[first + int(offset)] = corrected[offset]
+                changed += int(np.count_nonzero(changed_flags))
+                if last == len(il_index) or (last // chunk_size) % 20 == 0:
                     print(f"Processed {last}/{len(il_index)} traces")
             segy.flush()
 
@@ -203,21 +210,5 @@ def apply_coefficients(input_path, bundle_path, output_path, *,
     return target
 
 
-# User configuration: use the same source SEG-Y and sample-axis settings as
-# create_rms_map.py, and the bundle written by footprint_attenuation.py.
-input_segy_file = "/path/to/input.sgy"
-coefficient_bundle_file = "/path/to/destriping_coefficients.npz"
-output_segy_file = "/path/to/input_destriped.sgy"
-sample_interval_override = None  # ms for time, m for depth
-sample_start_override = None  # ms for time, m for depth
-trace_chunk_size = 1024
-overwrite_output = False
-
-
 if __name__ == "__main__":
-    apply_coefficients(
-        input_segy_file, coefficient_bundle_file, output_segy_file,
-        sample_interval_override=sample_interval_override,
-        sample_start_override=sample_start_override,
-        trace_chunk_size=trace_chunk_size, overwrite_output=overwrite_output,
-    )
+    raise SystemExit("Run python run_pipeline.py <parameter-file.yml> to configure compensation")

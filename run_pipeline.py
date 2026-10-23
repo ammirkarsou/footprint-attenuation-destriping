@@ -16,6 +16,7 @@ from matplotlib.path import Path as PolygonPath
 import apply_destriping
 import create_rms_map
 import footprint_attenuation
+from footprint_attenuation import mask_sidecar, save_valid_mask, load_valid_mask
 
 
 RMS_KEYS = {
@@ -24,17 +25,17 @@ RMS_KEYS = {
     "horizon_delimiter", "horizon_columns", "horizon_fixed_widths",
     "horizon_skip_rows", "horizon_missing_values", "horizon_decimal",
     "horizon_encoding", "sample_interval_override", "sample_start_override",
-    "trace_chunk_size", "existing_maps", "inlines_file", "crosslines_file",
+    "existing_maps", "inlines_file", "crosslines_file", "trace_chunk_size",
 }
 MASK_KEYS = {
-    "mode", "outer", "holes", "preview_map_index",
-    "pad_inline_meters", "pad_crossline_meters", "existing_polygon_file",
+    "mode", "scope", "outer", "holes", "preview_map_index",
+    "pad_inline_meters", "pad_crossline_meters", "existing_blended_maps",
 }
 ATTENUATION_KEYS = {
     "pad_inline_meters", "pad_crossline_meters", "filter_il_meters",
-    "filter_xl_meters", "alpha", "parameter_input_mode",
-    "pass_parameters", "preview_hardcoded_passes", "colormap_file",
-    "save_pass_differences",
+    "filter_xl_meters", "hole_filter_il_meters", "hole_filter_xl_meters",
+    "alpha", "parameter_input_mode", "pass_parameters",
+    "preview_hardcoded_passes", "colormap_file", "save_pass_differences",
 }
 
 
@@ -69,51 +70,18 @@ def polygon_points(value, name):
     return points
 
 
-def save_configured_mask(mask, path):
-    outer = polygon_points(mask.get("outer"), "mask.outer")
-    raw_holes = mask.get("holes", [])
-    if not isinstance(raw_holes, list):
-        raise ValueError("mask.holes must be a list of polygons")
-    holes = [polygon_points(value, f"mask.holes[{index}]")
-             for index, value in enumerate(raw_holes)]
-    outer_path = PolygonPath(np.vstack((outer, outer[0])))
-    for index, hole in enumerate(holes):
-        hole_path = PolygonPath(np.vstack((hole, hole[0])))
-        if (not outer_path.contains_points(hole).all() or
-                outer_path.intersects_path(hole_path, filled=False)):
-            raise ValueError(f"mask.holes[{index}] must lie completely inside mask.outer")
-    np.save(path, outer)
-    np.savez(path.with_name(path.stem + "_holes.npz"), **{
-        f"hole_{index}": hole for index, hole in enumerate(holes, 1)
-    })
-
-
-def draw_mask(mask, rms_map, il_file, xl_file, polygon_file, spacing):
-    command = [
-        sys.executable, str(Path(__file__).with_name("create_mask.py")),
-        "--rms-file", str(rms_map), "--il-file", str(il_file),
-        "--xl-file", str(xl_file), "--output-polygon-file", str(polygon_file),
-        "--inline-increment", str(spacing[0]),
-        "--crossline-increment", str(spacing[1]),
-        "--pad-inline-meters", str(mask.get("pad_inline_meters", 3000.0)),
-        "--pad-crossline-meters", str(mask.get("pad_crossline_meters", 1000.0)),
-    ]
-    subprocess.run(command, check=True)
-    if not polygon_file.is_file():
-        raise RuntimeError("No mask was saved; confirm the polygon and click Finish Masks")
-
-
 def window_sidecar(map_file):
     return map_file.with_name(map_file.stem + "_window.npz")
-
-
-def hole_sidecar(polygon_file):
-    return polygon_file.with_name(polygon_file.stem + "_holes.npz")
 
 
 def choose_saved_files(stage, required_paths, action):
     present = [path for path in required_paths if path.is_file()]
     if not present:
+        if action == "reuse":
+            raise FileNotFoundError(
+                f"Cannot reuse {stage}; required files are missing: " +
+                ", ".join(str(path) for path in required_paths)
+            )
         return False
     complete = len(present) == len(required_paths)
     if action == "reuse":
@@ -202,6 +170,137 @@ def validate_saved_rms(maps, il_file, xl_file, source, domain):
                 raise ValueError(f"Saved RMS window metadata does not match: {map_file}")
 
 
+def get_mask_scope(mask_config, map_paths, working_dir, cache_dir):
+    """Resolve single vs multiple mask scope from config, create_rms_map sidecar, or prompt."""
+    if len(map_paths) <= 1:
+        return "single"
+    if mask_config.get("scope") in ("single", "multiple"):
+        return mask_config["scope"]
+
+    for parent in [working_dir, cache_dir, map_paths[0].parent]:
+        if parent is not None:
+            cand = parent / (map_paths[0].stem + "_mask_scope.txt")
+            if cand.is_file():
+                txt = cand.read_text(encoding="utf-8").strip().lower()
+                if txt in ("single", "multiple"):
+                    return txt
+
+    while True:
+        try:
+            choice = input(
+                "\nDo you want to use a [s]ingle mask for all RMS maps, or [m]ultiple masks? [single/multiple] (default: single): "
+            ).strip().lower()
+        except EOFError:
+            return "single"
+        if choice in ("", "s", "single", "1"):
+            return "single"
+        if choice in ("m", "multiple", "2", "each"):
+            return "multiple"
+        print("Please enter 'single' or 'multiple'.")
+
+
+def blend_configured_mask(mask, rms_maps, il_unique, xl_unique, blended_outputs, spacing, attenuation):
+    """Headless blending fallback when polygon vertices are specified directly in YAML."""
+    from scipy.ndimage import uniform_filter
+
+    outer = polygon_points(mask.get("outer"), "mask.outer")
+    raw_holes = mask.get("holes", [])
+    if not isinstance(raw_holes, list):
+        raise ValueError("mask.holes must be a list of polygons")
+    holes = [polygon_points(v, f"mask.holes[{i}]") for i, v in enumerate(raw_holes)]
+
+    pad_il = mask["pad_inline_meters"]
+    pad_xl = mask["pad_crossline_meters"]
+    n_pad_il = int(np.round(pad_il / spacing[0]))
+    n_pad_xl = int(np.round(pad_xl / spacing[1]))
+
+    il_step = np.median(np.diff(il_unique)) if len(il_unique) > 1 else 1.0
+    xl_step = np.median(np.diff(xl_unique)) if len(xl_unique) > 1 else 1.0
+
+    padded_il = np.r_[il_unique[0] - np.arange(n_pad_il, 0, -1) * il_step,
+                      il_unique,
+                      il_unique[-1] + np.arange(1, n_pad_il + 1) * il_step]
+    padded_xl = np.r_[xl_unique[0] - np.arange(n_pad_xl, 0, -1) * xl_step,
+                      xl_unique,
+                      xl_unique[-1] + np.arange(1, n_pad_xl + 1) * xl_step]
+    XL, IL = np.meshgrid(padded_xl, padded_il)
+    points = np.column_stack((XL.ravel(), IL.ravel()))
+
+    outer_grid = PolygonPath(outer).contains_points(points).reshape(len(padded_il), len(padded_xl))
+    hole_grid = np.zeros(outer_grid.shape, dtype=bool)
+    for hole in holes:
+        hole_grid |= PolygonPath(hole).contains_points(points, radius=1e-9).reshape(outer_grid.shape)
+
+    b_il = attenuation["filter_il_meters"]
+    b_xl = attenuation["filter_xl_meters"]
+    h_il = attenuation.get("hole_filter_il_meters")
+    h_xl = attenuation.get("hole_filter_xl_meters")
+    h_il = b_il if h_il is None else float(h_il)
+    h_xl = b_xl if h_xl is None else float(h_xl)
+
+    def meters_to_window(m, inc):
+        if m <= 0.0:
+            return 1
+        w = int(np.round(m / inc))
+        if w <= 1:
+            return 3
+        if w % 2 == 0:
+            w += 1
+        return w
+
+    def smooth_binary(grid, win_il, win_xl):
+        if win_il <= 1 and win_xl <= 1:
+            return grid.astype(np.float32)
+        s = uniform_filter(grid.astype(np.float32), size=(max(1, win_il), max(1, win_xl)), mode="nearest")
+        s = np.clip(s, 0.0, 1.0)
+        s[s < 1.0] = 0.0
+        s = uniform_filter(s, size=(max(1, win_il), max(1, win_xl)), mode="nearest")
+        return np.clip(s, 0.0, 1.0)
+
+    s_outer = smooth_binary(outer_grid, meters_to_window(b_il, spacing[0]), meters_to_window(b_xl, spacing[1]))
+    s_holes = smooth_binary(~hole_grid, meters_to_window(h_il, spacing[0]), meters_to_window(h_xl, spacing[1])) if holes else 1.0
+    smooth = s_outer * s_holes
+
+    mask_grid = outer_grid & ~hole_grid
+    il_slice = slice(n_pad_il, n_pad_il + len(il_unique)) if n_pad_il > 0 else slice(None)
+    xl_slice = slice(n_pad_xl, n_pad_xl + len(xl_unique)) if n_pad_xl > 0 else slice(None)
+    valid_core = mask_grid[il_slice, xl_slice]
+
+    for r_path, out_path in zip(rms_maps, blended_outputs):
+        rms = np.load(r_path)
+        p1, p99 = np.nanpercentile(rms, [1.0, 99.0])
+        clipped = np.nan_to_num(np.clip(rms, p1, p99), nan=0.0)
+        padded = np.pad(clipped, ((n_pad_il, n_pad_il), (n_pad_xl, n_pad_xl)), mode="constant", constant_values=0.0)
+        inside = padded[mask_grid & (padded > 0)]
+        med = float(np.median(inside)) if inside.size > 0 else 0.0
+        blended = padded * smooth + (1.0 - smooth) * med
+        np.save(out_path, blended[il_slice, xl_slice])
+        save_valid_mask(out_path, valid_core)
+
+
+def draw_mask_batch(mask, maps, il_file, xl_file, spacing, scope, attenuation):
+    command = [
+        sys.executable, str(Path(__file__).with_name("create_mask.py")),
+        "--rms-files", *[str(m) for m in maps],
+        "--il-file", str(il_file),
+        "--xl-file", str(xl_file),
+        "--scope", str(scope),
+        "--preview-index", str(mask.get("preview_map_index", 0)),
+        "--inline-increment", str(spacing[0]),
+        "--crossline-increment", str(spacing[1]),
+        "--pad-inline-meters", str(mask["pad_inline_meters"]),
+        "--pad-crossline-meters", str(mask["pad_crossline_meters"]),
+        "--filter-il-meters", str(attenuation["filter_il_meters"]),
+        "--filter-xl-meters", str(attenuation["filter_xl_meters"]),
+    ]
+    for key in ("hole_filter_il_meters", "hole_filter_xl_meters"):
+        if key in attenuation and attenuation[key] is not None:
+            cli_flag = f"--{key.replace('_', '-')}"
+            command.extend([cli_flag, str(attenuation[key])])
+
+    subprocess.run(command, check=True)
+
+
 def run_pipeline(config, config_file):
     if not isinstance(config, dict):
         raise ValueError("YAML root must be a mapping")
@@ -251,14 +350,12 @@ def run_pipeline(config, config_file):
     mask = section(config, "mask", MASK_KEYS)
     attenuation = section(config, "attenuation", ATTENUATION_KEYS)
     application = section(
-        config, "application", {"trace_chunk_size", "overwrite_output"}, required=False
+        config, "application", {"overwrite_output", "trace_chunk_size"}, required=False
     )
     if not isinstance(application.get("overwrite_output", False), bool):
         raise ValueError("application.overwrite_output must be true or false")
-    output_chunk_size = application.get("trace_chunk_size", 1024)
-    if (isinstance(output_chunk_size, bool) or
-            not isinstance(output_chunk_size, int) or output_chunk_size < 1):
-        raise ValueError("application.trace_chunk_size must be a positive integer")
+    if "trace_chunk_size" in application:
+        print("Ignoring application.trace_chunk_size; chunk size is automatic")
     if target.exists() and not application.get("overwrite_output", False):
         raise FileExistsError(f"Output already exists: {target}")
 
@@ -279,11 +376,8 @@ def run_pipeline(config, config_file):
             if not np.isfinite(value) or (key == "sample_interval_override" and value <= 0):
                 raise ValueError(f"rms.{key} has an invalid value")
         sample_settings[key] = value
-    if "trace_chunk_size" in rms and (
-        isinstance(rms["trace_chunk_size"], bool) or
-        not isinstance(rms["trace_chunk_size"], int) or rms["trace_chunk_size"] < 1
-    ):
-        raise ValueError("rms.trace_chunk_size must be a positive integer")
+    if "trace_chunk_size" in rms:
+        print("Ignoring rms.trace_chunk_size; chunk size is automatic")
     if mode == "constant":
         if "constant_top" not in rms or "constant_bottom" not in rms:
             raise ValueError("Constant RMS mode needs constant_top and constant_bottom")
@@ -292,8 +386,9 @@ def run_pipeline(config, config_file):
             bottom = float(rms["constant_bottom"])
         except (TypeError, ValueError) as exc:
             raise ValueError("Constant RMS top/bottom must be numeric") from exc
-        if not np.isfinite(top) or not np.isfinite(bottom) or top >= bottom:
-            raise ValueError("Constant RMS window requires finite top < bottom")
+        if (not np.isfinite(top) or not np.isfinite(bottom) or
+                (bottom != create_rms_map.END_OF_TRACE and top >= bottom)):
+            raise ValueError("Constant RMS window requires finite top < bottom, or bottom: -1")
     else:
         if ("horizon_file" not in rms or "horizon_z_unit" not in rms or
                 not rms.get("horizon_windows")):
@@ -311,28 +406,32 @@ def run_pipeline(config, config_file):
                 lower, upper = (float(value) for value in pair)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"rms.horizon_windows[{index}] must be [lower, upper]") from exc
-            if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
-                raise ValueError(f"rms.horizon_windows[{index}] needs finite lower < upper")
+            if (not np.isfinite(lower) or not np.isfinite(upper) or
+                    (upper != create_rms_map.END_OF_TRACE and lower >= upper)):
+                raise ValueError(
+                    f"rms.horizon_windows[{index}] needs finite lower < upper, or upper: -1"
+                )
             windows.append((lower, upper))
 
     mask_mode = mask.get("mode")
     if mask_mode not in ("interactive", "vertices"):
         raise ValueError("mask.mode must be 'interactive' or 'vertices'")
     for key in ("pad_inline_meters", "pad_crossline_meters"):
-        if key in mask:
-            try:
-                value = float(mask[key])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"mask.{key} must be numeric") from exc
-            if not np.isfinite(value) or value < 0:
-                raise ValueError(f"mask.{key} must be finite and nonnegative")
+        if key not in mask:
+            raise ValueError(f"mask.{key} is required in the parameter file")
+        try:
+            value = float(mask[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"mask.{key} must be numeric") from exc
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"mask.{key} must be finite and nonnegative")
+        mask[key] = value
     if mask_mode == "interactive":
         preview_index = mask.get("preview_map_index", 0)
         map_count = 1 if mode == "constant" else len(windows)
         if not isinstance(preview_index, int) or not 0 <= preview_index < map_count:
             raise ValueError("mask.preview_map_index is outside the RMS map list")
     if mask_mode == "vertices":
-        # Validate polygons before the potentially long SEG-Y calculation.
         outer = polygon_points(mask.get("outer"), "mask.outer")
         if not isinstance(mask.get("holes", []), list):
             raise ValueError("mask.holes must be a list of polygons")
@@ -359,11 +458,18 @@ def run_pipeline(config, config_file):
         existing_xl = path_from_yaml(rms["crosslines_file"], base, "rms.crosslines_file")
     elif "inlines_file" in rms or "crosslines_file" in rms:
         raise ValueError("rms.inlines_file and crosslines_file require existing_maps")
-    existing_polygon = (path_from_yaml(mask["existing_polygon_file"], base,
-                                       "mask.existing_polygon_file")
-                        if "existing_polygon_file" in mask else None)
 
-    input_mode = attenuation.get("parameter_input_mode", "hardcoded")
+    existing_blended = None
+    if "existing_blended_maps" in mask:
+        raw_b = mask["existing_blended_maps"]
+        if not isinstance(raw_b, list) or not raw_b:
+            raise ValueError("mask.existing_blended_maps must be a nonempty list of paths")
+        expected = 1 if mode == "constant" else len(windows)
+        if len(raw_b) != expected:
+            raise ValueError(f"mask.existing_blended_maps needs {expected} map path(s)")
+        existing_blended = [path_from_yaml(p, base, "mask.existing_blended_maps") for p in raw_b]
+
+    input_mode = attenuation.get("parameter_input_mode")
     if input_mode not in ("hardcoded", "interactive"):
         raise ValueError("attenuation.parameter_input_mode must be hardcoded or interactive")
     passes = attenuation.get("pass_parameters", [])
@@ -372,17 +478,28 @@ def run_pipeline(config, config_file):
     normalized_passes = []
     for index, parameters in enumerate(passes):
         try:
-            normalized_passes.append(footprint_attenuation.validate_pass(parameters))
+            normalized_passes.append(footprint_attenuation.validate_user_pass(parameters))
         except ValueError as exc:
             raise ValueError(f"Invalid attenuation pass {index + 1}: {exc}") from exc
     normalized_attenuation = dict(attenuation)
+    required_attenuation = (
+        "pad_inline_meters", "pad_crossline_meters", "filter_il_meters",
+        "filter_xl_meters", "alpha",
+    )
+    for key in required_attenuation:
+        if attenuation.get(key) is None:
+            raise ValueError(f"attenuation.{key} is required in the parameter file")
     for key in ("pad_inline_meters", "pad_crossline_meters", "filter_il_meters",
-                "filter_xl_meters", "alpha"):
+                "filter_xl_meters", "hole_filter_il_meters", "hole_filter_xl_meters",
+                "alpha"):
         if key in attenuation:
+            if attenuation[key] is None:
+                normalized_attenuation[key] = None
+                continue
             try:
                 value = float(attenuation[key])
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"attenuation.{key} must be numeric") from exc
+                raise ValueError(f"attenuation.{key} must be numeric or null") from exc
             minimum = 0 if key.startswith("pad_") or key == "alpha" else 1e-12
             if not np.isfinite(value) or value < minimum or (key == "alpha" and value >= 1):
                 raise ValueError(f"attenuation.{key} has an invalid value")
@@ -396,7 +513,7 @@ def run_pipeline(config, config_file):
     }
     for key in RMS_KEYS - {
         "window_mode", "vertical_domain", "horizon_file", "existing_maps",
-        "inlines_file", "crosslines_file",
+        "inlines_file", "crosslines_file", "trace_chunk_size",
     }:
         if key in rms:
             rms_overrides[key] = rms[key]
@@ -412,10 +529,17 @@ def run_pipeline(config, config_file):
         "crossline_increment": spacing[1], "rms_window_mode": "absolute",
         "parameter_input_mode": input_mode, "pass_parameters": normalized_passes,
     }
-    for key in ATTENUATION_KEYS - {"parameter_input_mode", "pass_parameters", "colormap_file"}:
+    # Feathering lengths are consumed by the mask stage, not attenuation.
+    mask_feathering_keys = {
+        "filter_il_meters", "filter_xl_meters",
+        "hole_filter_il_meters", "hole_filter_xl_meters",
+    }
+    for key in ATTENUATION_KEYS - {
+        "parameter_input_mode", "pass_parameters", "colormap_file",
+    } - mask_feathering_keys:
         if key in normalized_attenuation:
             fp_overrides[key] = normalized_attenuation[key]
-    if "colormap_file" in attenuation:
+    if attenuation.get("colormap_file"):
         fp_overrides["colormap_file"] = str(path_from_yaml(
             attenuation["colormap_file"], base, "attenuation.colormap_file"
         ))
@@ -437,14 +561,13 @@ def run_pipeline(config, config_file):
             new_rms_file = working / "rms.npy"
             new_il_file = working / "inlines.npy"
             new_xl_file = working / "crosslines.npy"
-            new_polygon_file = working / "polygon.npy"
             bundle_file = working / "coefficients.npz"
             if mode == "constant":
                 new_maps = [new_rms_file]
             else:
                 new_maps = [create_rms_map.output_for_window(
                     new_rms_file, index, lower, upper,
-                    rms.get("horizon_z_unit", create_rms_map.horizon_z_unit),
+                    rms["horizon_z_unit"],
                 ) for index, (lower, upper) in enumerate(windows, 1)]
 
             if existing_maps is not None:
@@ -474,6 +597,8 @@ def run_pipeline(config, config_file):
                     shutil.copyfile(saved_map, working_map)
                     shutil.copyfile(window_sidecar(saved_map),
                                     window_sidecar(working_map))
+                new_il_file.write_bytes(il_file.read_bytes())
+                new_xl_file.write_bytes(xl_file.read_bytes())
             else:
                 if mode == "horizon" and not horizon_file.is_file():
                     raise FileNotFoundError(
@@ -494,40 +619,82 @@ def run_pipeline(config, config_file):
                 ):
                     publish_file(fresh, saved_path)
 
-            polygon_file = (existing_polygon or
-                            (cache_directory / "polygon.npy" if cache_directory
-                             else new_polygon_file))
+                # Persist scope choice if saved by create_rms_map
+                work_scope_file = new_rms_file.with_name(new_rms_file.stem + "_mask_scope.txt")
+                if work_scope_file.is_file() and cache_directory is not None:
+                    publish_file(work_scope_file, cache_directory / (maps[0].stem + "_mask_scope.txt"))
 
-            print("Stage 2/4: survey mask", flush=True)
-            reuse_mask = choose_saved_files("mask", [polygon_file], on_existing)
-            if reuse_mask:
-                polygon_points(np.load(polygon_file, allow_pickle=False), "saved mask")
-                for index, hole in enumerate(footprint_attenuation.load_holes(polygon_file)):
-                    polygon_points(hole, f"saved mask hole {index + 1}")
+            # -------------------------------------------------------------
+            # Stage 2: Survey Mask & Blended RMS Generation
+            # -------------------------------------------------------------
+            print("Stage 2/4: survey mask & blended RMS generation", flush=True)
+            survey_shape = (len(np.load(new_il_file, allow_pickle=False)),
+                            len(np.load(new_xl_file, allow_pickle=False)))
+            working_blended_maps = [m.with_name(m.stem + "_blended.npy") for m in new_maps]
+
+            if existing_blended is not None:
+                saved_blended_maps = existing_blended
+            elif cache_directory is not None:
+                saved_blended_maps = [cache_directory / (m.stem + "_blended.npy") for m in maps]
             else:
-                if mask_mode == "interactive":
-                    draw_mask(mask, maps[preview_index], il_file, xl_file,
-                              new_polygon_file, spacing)
-                else:
-                    save_configured_mask(mask, new_polygon_file)
-                publish_file(new_polygon_file, polygon_file)
-                publish_file(hole_sidecar(new_polygon_file), hole_sidecar(polygon_file))
+                saved_blended_maps = working_blended_maps
 
+            required_blended = [
+                path for b_map in saved_blended_maps
+                for path in (b_map, window_sidecar(b_map), mask_sidecar(b_map))
+            ]
+
+            reuse_blended = choose_saved_files("blended RMS maps", required_blended, on_existing)
+            if reuse_blended:
+                for saved_b, work_b in zip(saved_blended_maps, working_blended_maps):
+                    shutil.copyfile(saved_b, work_b)
+                    shutil.copyfile(window_sidecar(saved_b), window_sidecar(work_b))
+                    load_valid_mask(saved_b, survey_shape)
+                    shutil.copyfile(mask_sidecar(saved_b), mask_sidecar(work_b))
+            else:
+                mask_scope = get_mask_scope(mask, maps, working, cache_directory)
+                print(f"Masking strategy: {mask_scope.upper()} ({len(new_maps)} map{'s' if len(new_maps) > 1 else ''})", flush=True)
+
+                if mask_mode == "interactive":
+                    draw_mask_batch(mask, new_maps, new_il_file, new_xl_file, spacing, mask_scope, normalized_attenuation)
+                else:
+                    il_arr = np.load(new_il_file, allow_pickle=False)
+                    xl_arr = np.load(new_xl_file, allow_pickle=False)
+                    blend_configured_mask(mask, new_maps, il_arr, xl_arr, working_blended_maps, spacing, normalized_attenuation)
+
+                # Validate and publish blended maps and duplicate window metadata
+                for work_m, work_b, saved_b in zip(new_maps, working_blended_maps, saved_blended_maps):
+                    if not work_b.is_file():
+                        raise RuntimeError(f"Expected blended map was not generated: {work_b}")
+                    if not mask_sidecar(work_b).is_file():
+                        raise RuntimeError(f"Expected survey mask was not generated: {mask_sidecar(work_b)}")
+                    load_valid_mask(work_b, survey_shape)
+                    shutil.copyfile(window_sidecar(work_m), window_sidecar(work_b))
+                    publish_file(work_b, saved_b)
+                    publish_file(window_sidecar(work_b), window_sidecar(saved_b))
+                    publish_file(mask_sidecar(work_b), mask_sidecar(saved_b))
+
+            # -------------------------------------------------------------
+            # Stage 3: Destriping Attenuation on Pre-Blended Maps
+            # -------------------------------------------------------------
             override(footprint_attenuation, {
-                **fp_overrides, "rms_maps": [(str(path), None) for path in new_maps],
-                "il_file": str(il_file), "xl_file": str(xl_file),
-                "polygon_file": str(polygon_file),
+                **fp_overrides,
+                "rms_maps": [(str(path), None) for path in working_blended_maps],
+                "il_file": str(new_il_file),
+                "xl_file": str(new_xl_file),
                 "output_bundle_file": str(bundle_file),
             })
             print("Stage 3/4: calculating attenuation coefficients", flush=True)
             footprint_attenuation.main()
 
+            # -------------------------------------------------------------
+            # Stage 4: SEG-Y Trace Compensation
+            # -------------------------------------------------------------
             print("Stage 4/4: compensating SEG-Y", flush=True)
             apply_destriping.apply_coefficients(
                 source, bundle_file, target,
                 sample_interval_override=sample_settings["sample_interval_override"],
                 sample_start_override=sample_settings["sample_start_override"],
-                trace_chunk_size=output_chunk_size,
                 overwrite_output=application.get("overwrite_output", False),
             )
         print(f"Complete: {target}; temporary files removed", flush=True)
