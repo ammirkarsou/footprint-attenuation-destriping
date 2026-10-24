@@ -3,11 +3,10 @@
 # Relative paths are resolved from the YAML file's directory.
 input_segy: /home/ammir/Desktop/Seismic_Dataset/Forge/2018-19_Reflection_Processing/3D_Survey/Forge3d_ANI_PSDM_Stack_UnEnh.segy
 output_segy: Forge3d_ANI_PSDM_Stack_UnEnh_Footprint_atten.segy
-# temporary_directory: /path/to/scratch  # defaults to the output directory
-cache_directory: .destriping_cache  # keep RMS and blended RMS maps for later runs
+cache_directory: .destriping_cache  # saved arrays, masks, coefficients, and temporary work
 on_existing: prompt  # ask whether to reuse or recalculate saved maps
 # For unattended runs, use on_existing: reuse or on_existing: recalculate.
-# Remove cache_directory for a one-time run that deletes all intermediates.
+# Without cache_directory, .destriping_cache is created beside output_segy.
 
 geometry:
   # Physical distance between adjacent grid lines in meters, supplied by you.
@@ -17,19 +16,26 @@ geometry:
 rms:
   window_mode: constant
   vertical_domain: depth  # depth in meters for this PSDM SEG-Y
-  constant_top: 0.0        # edit to the desired window top, in meters
-  constant_bottom: 1400.0  # use -1 to continue to the last SEG-Y sample
-  # For a time SEG-Y, use vertical_domain: time and set top/bottom in ms.
-  # Example: constant_top: 0.0 and constant_bottom: 1400.0 means 0-1400 ms.
-  # When you have a horizon, change window_mode above to horizon and uncomment
-  # this block. The constant_top/bottom values are ignored in horizon mode.
+  # The same windows setting works in constant and horizon modes.
+  # In constant mode these are absolute limits; in horizon mode they are
+  # offsets from each horizon pick. -1 means the final SEG-Y sample.
+  windows:
+    - [0.0, 1400.0]
+    - [1401.0, 1800.0]
+  # For consecutive 100-unit windows from 1 to the end, use:
+  #   - [1.0, -1, 100.0]
+  # This generates [1, 101], [101, 201], ... and a final [top, -1].
+  # For 0 to 1400 in 100-unit windows, use: - [0.0, 1400.0, 100.0]
+  # You may mix stepped entries and custom pairs, for example:
+  #   - [1400.0, 2800.0]
+  #   - [2800.0, -1]
+  # For time data use vertical_domain: time and limits in milliseconds.
+  # To use a horizon, set window_mode: horizon above and provide these settings:
   # horizon_file: /path/to/horizon.txt
   # horizon_z_unit: m  # ms or s for time; m or ft for depth
-  # horizon_windows:
-  #   - [0.0, 1400.0]     # horizon to horizon + 1400
-  #   - [1400.0, 2800.0]  # horizon + 1400 to horizon + 2800
-  #   - [2800.0, -1]      # horizon + 2800 to the last SEG-Y sample
-  # To start at horizon + 1800 and continue to the end, use [1800.0, -1].
+  # For horizon + 1800 to the end, replace windows with [[1800.0, -1]].
+  # A stepped horizon range also uses [start, end, step]; end: -1 reaches
+  # the SEG-Y end, so late windows may cover fewer traces.
   horizon_delimiter: auto  # whitespace, tab, comma, semicolon, pipe, fixed
   horizon_columns: null  # or [inline_column, crossline_column, z_column], zero-based
   horizon_fixed_widths: null  # e.g. [8, 8, 12] for fixed-width data
@@ -41,20 +47,21 @@ rms:
   # these overrides in ms (time) or m (depth):
   sample_interval_override: null
   sample_start_override: null
-  # If you change the constant window, choose recalculate at the saved-map prompt.
+  # If you change windows, choose recalculate at the saved-map prompt.
   # To use existing RMS maps, provide their paths and coordinate axes.
-  # In horizon mode, list one map for each horizon_windows entry, in order.
+  # List one map for each generated or explicit window, in order.
   # existing_maps: [/path/to/constant_rms.npy]
   # inlines_file: /path/to/Inlines.npy
   # crosslines_file: /path/to/Crosslines.npy
 
 mask:
-  mode: interactive  # draw boundary and holes; click Finish Masks
+  mode: interactive  # draw boundary/holes; multiple masks prefill the previous boundary only
+  # scope: multiple  # optional: single or multiple; omit to choose when step 2 recalculates
   preview_map_index: 0  # zero-based RMS map index to show when drawing
   pad_inline_meters: 3000.0
   pad_crossline_meters: 1000.0
   # To reuse completed blending, set existing_blended_maps to the .npy paths
-  # for each RMS window, with matching _window.npz and _mask.npy files.
+  # for each RMS window, with matching _window.npz, _mask.npy, and _taper.npy files.
   # existing_blended_maps: [/path/to/blended_rms.npy]
   # For a noninteractive run, set mode: vertices and provide coordinates:
   # outer: [[200, 100], [300, 100], [300, 200], [200, 200]]
@@ -63,7 +70,9 @@ mask:
   # Coordinates are [crossline, inline], matching the polygon plot axes.
 
 attenuation:
-  parameter_input_mode: interactive  # hardcoded or interactive for per-pass QC and prompts
+  save_pass_pngs: true  # save input, every accepted pass output, and final coefficient PNG per RMS map
+  png_output_directory: ./destriping_pngs  # created automatically when save_pass_pngs is true
+  parameter_input_mode: hardcoded  # hardcoded or interactive for per-pass QC and prompts
   # Two suggested passes. Each tuple is (f1, f2, f3, a1): filter lengths
   # in meters, then the standard-deviation multiplier. Each filter runs twice
   # in the fixed order inline, crossline, crossline.
@@ -73,13 +82,13 @@ attenuation:
   alpha: 0.3
   pad_inline_meters: 3000.0
   pad_crossline_meters: 200.0
-  filter_il_meters: 2000.0
+  filter_il_meters: 2000.0  # Boundary ramp; attenuation runs through its nonzero part
   filter_xl_meters: 2000.0
-  hole_filter_il_meters: 100.0     # Dedicated hole buffer/feathering
+  hole_filter_il_meters: 100.0     # Dedicated hole ramp
   hole_filter_xl_meters: 100.0
-  preview_hardcoded_passes: false
-  save_pass_differences: false
+  preview_hardcoded_passes: true  # true: close each plot, then accept or enter a replacement tuple in the terminal
   colormap_file: null  # optional .alut path; viridis if unavailable
 
 application:
   overwrite_output: true
+  write_segy: true  # false: inspect pass previews/PNGs and coefficients without writing SEG-Y

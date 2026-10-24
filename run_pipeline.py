@@ -16,11 +16,14 @@ from matplotlib.path import Path as PolygonPath
 import apply_destriping
 import create_rms_map
 import footprint_attenuation
-from footprint_attenuation import mask_sidecar, save_valid_mask, load_valid_mask
+from footprint_attenuation import (
+    mask_sidecar, taper_sidecar, save_valid_mask, save_mask_taper,
+    load_valid_mask, load_mask_taper,
+)
 
 
 RMS_KEYS = {
-    "window_mode", "vertical_domain", "constant_top", "constant_bottom",
+    "window_mode", "vertical_domain", "windows", "constant_top", "constant_bottom",
     "horizon_file", "horizon_z_unit", "horizon_windows",
     "horizon_delimiter", "horizon_columns", "horizon_fixed_widths",
     "horizon_skip_rows", "horizon_missing_values", "horizon_decimal",
@@ -35,7 +38,8 @@ ATTENUATION_KEYS = {
     "pad_inline_meters", "pad_crossline_meters", "filter_il_meters",
     "filter_xl_meters", "hole_filter_il_meters", "hole_filter_xl_meters",
     "alpha", "parameter_input_mode", "pass_parameters",
-    "preview_hardcoded_passes", "colormap_file", "save_pass_differences",
+    "preview_hardcoded_passes", "colormap_file", "save_pass_pngs",
+    "png_output_directory",
 }
 
 
@@ -56,6 +60,80 @@ def path_from_yaml(value, base, name):
         raise ValueError(f"{name} must be a nonempty path")
     path = Path(os.path.expandvars(value)).expanduser()
     return (base / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def parse_windows(specification, name, end_value=None):
+    """Expand [top, bottom] and [start, end, step] entries into pairs."""
+    if not isinstance(specification, list) or not specification:
+        raise ValueError(f"{name} must be a nonempty list of [top, bottom] or [start, end, step]")
+    windows = []
+    for index, entry in enumerate(specification):
+        try:
+            if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+                raise ValueError
+            values = [float(value) for value in entry]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name}[{index}] must be [top, bottom] or [start, end, step]"
+            ) from exc
+        lower, upper = values[:2]
+        if (not np.isfinite(lower) or not np.isfinite(upper) or
+                (upper != create_rms_map.END_OF_TRACE and lower >= upper)):
+            raise ValueError(f"{name}[{index}] needs top < bottom, or bottom: -1")
+        if len(values) == 2:
+            windows.append((lower, upper))
+            continue
+        step = values[2]
+        if not np.isfinite(step) or step <= 0:
+            raise ValueError(f"{name}[{index}] needs a finite positive step")
+        limit = end_value if upper == create_rms_map.END_OF_TRACE else upper
+        if limit is None or not np.isfinite(limit) or lower >= limit:
+            raise ValueError(f"{name}[{index}] start must precede the final SEG-Y bound")
+        count = int(np.ceil((limit - lower) / step - 1e-12))
+        if len(windows) + count > 10000:
+            raise ValueError(f"{name} would create over 10000 maps; choose a larger step")
+        for part in range(count):
+            top = lower + part * step
+            bottom = (create_rms_map.END_OF_TRACE if
+                      upper == create_rms_map.END_OF_TRACE and part == count - 1 else
+                      min(lower + (part + 1) * step, limit))
+            windows.append((top, bottom))
+    return windows
+
+
+def stepped_trace_end(source, rms, mode, horizon_file, sample_settings, domain):
+    """Resolve the final sample into absolute coordinates or horizon offsets."""
+    with segyio.open(str(source), mode="r", strict=False, ignore_geometry=True) as segy:
+        if not segy.tracecount or not segy.samples.size:
+            raise ValueError("SEG-Y has no traces or samples")
+        interval = (segyio.tools.dt(segy) / 1000.0 if
+                    sample_settings["sample_interval_override"] is None else
+                    sample_settings["sample_interval_override"])
+        start = (segy.header[0][segyio.TraceField.DelayRecordingTime] if
+                 sample_settings["sample_start_override"] is None else
+                 sample_settings["sample_start_override"])
+        if not np.isfinite(interval) or interval <= 0 or not np.isfinite(start):
+            raise ValueError("SEG-Y sample axis is invalid")
+        last_sample = start + (segy.samples.size - 1) * interval
+        if mode == "constant":
+            return last_sample
+        inlines = segy.attributes(segyio.TraceField.INLINE_3D)[:]
+        crosslines = segy.attributes(segyio.TraceField.CROSSLINE_3D)[:]
+    points, z = create_rms_map.read_horizon(
+        horizon_file,
+        delimiter=rms.get("horizon_delimiter", create_rms_map.horizon_delimiter),
+        columns=rms.get("horizon_columns", create_rms_map.horizon_columns),
+        fixed_widths=rms.get("horizon_fixed_widths", create_rms_map.horizon_fixed_widths),
+        skip_rows=rms.get("horizon_skip_rows", create_rms_map.horizon_skip_rows),
+        missing_values=rms.get("horizon_missing_values", create_rms_map.horizon_missing_values),
+        decimal=rms.get("horizon_decimal", create_rms_map.horizon_decimal),
+        encoding=rms.get("horizon_encoding", create_rms_map.horizon_encoding),
+    )
+    picks = create_rms_map.interpolate_horizon(points, z, inlines, crosslines)
+    if not np.any(np.isfinite(picks)):
+        raise ValueError("Horizon does not cover any SEG-Y trace positions")
+    scale = create_rms_map.z_scale(rms["horizon_z_unit"], domain)
+    return last_sample / scale - float(np.min(picks[np.isfinite(picks)]))
 
 
 def polygon_points(value, name):
@@ -170,20 +248,12 @@ def validate_saved_rms(maps, il_file, xl_file, source, domain):
                 raise ValueError(f"Saved RMS window metadata does not match: {map_file}")
 
 
-def get_mask_scope(mask_config, map_paths, working_dir, cache_dir):
-    """Resolve single vs multiple mask scope from config, create_rms_map sidecar, or prompt."""
+def get_mask_scope(mask_config, map_paths):
+    """Choose the mask scope when stage 2 is recalculated."""
     if len(map_paths) <= 1:
         return "single"
     if mask_config.get("scope") in ("single", "multiple"):
         return mask_config["scope"]
-
-    for parent in [working_dir, cache_dir, map_paths[0].parent]:
-        if parent is not None:
-            cand = parent / (map_paths[0].stem + "_mask_scope.txt")
-            if cand.is_file():
-                txt = cand.read_text(encoding="utf-8").strip().lower()
-                if txt in ("single", "multiple"):
-                    return txt
 
     while True:
         try:
@@ -191,7 +261,10 @@ def get_mask_scope(mask_config, map_paths, working_dir, cache_dir):
                 "\nDo you want to use a [s]ingle mask for all RMS maps, or [m]ultiple masks? [single/multiple] (default: single): "
             ).strip().lower()
         except EOFError:
-            return "single"
+            raise RuntimeError(
+                "Mask recalculation needs a scope choice; set mask.scope to "
+                "'single' or 'multiple' for an unattended run"
+            ) from None
         if choice in ("", "s", "single", "1"):
             return "single"
         if choice in ("m", "multiple", "2", "each"):
@@ -257,9 +330,14 @@ def blend_configured_mask(mask, rms_maps, il_unique, xl_unique, blended_outputs,
         s = uniform_filter(s, size=(max(1, win_il), max(1, win_xl)), mode="nearest")
         return np.clip(s, 0.0, 1.0)
 
-    s_outer = smooth_binary(outer_grid, meters_to_window(b_il, spacing[0]), meters_to_window(b_xl, spacing[1]))
+    b_size = (meters_to_window(b_il, spacing[0]), meters_to_window(b_xl, spacing[1]))
+    s_outer = smooth_binary(outer_grid, *b_size)
     s_holes = smooth_binary(~hole_grid, meters_to_window(h_il, spacing[0]), meters_to_window(h_xl, spacing[1])) if holes else 1.0
     smooth = s_outer * s_holes
+    coefficient_taper = np.clip(
+        uniform_filter(outer_grid.astype(np.float32), size=b_size, mode="nearest") * s_holes,
+        0.0, 1.0,
+    ).astype(np.float32)
 
     mask_grid = outer_grid & ~hole_grid
     il_slice = slice(n_pad_il, n_pad_il + len(il_unique)) if n_pad_il > 0 else slice(None)
@@ -276,6 +354,7 @@ def blend_configured_mask(mask, rms_maps, il_unique, xl_unique, blended_outputs,
         blended = padded * smooth + (1.0 - smooth) * med
         np.save(out_path, blended[il_slice, xl_slice])
         save_valid_mask(out_path, valid_core)
+        save_mask_taper(out_path, coefficient_taper[il_slice, xl_slice])
 
 
 def draw_mask_batch(mask, maps, il_file, xl_file, spacing, scope, attenuation):
@@ -311,28 +390,32 @@ def run_pipeline(config, config_file):
     }
     if unknown:
         raise ValueError(f"Unknown top-level setting(s): {', '.join(sorted(unknown))}")
+    application = section(
+        config, "application", {"overwrite_output", "write_segy", "trace_chunk_size"},
+        required=False,
+    )
+    for key, default in (("overwrite_output", False), ("write_segy", True)):
+        if not isinstance(application.get(key, default), bool):
+            raise ValueError(f"application.{key} must be true or false")
+    write_segy = application.get("write_segy", True)
+    if "trace_chunk_size" in application:
+        print("Ignoring application.trace_chunk_size; chunk size is automatic")
     base = Path(config_file).resolve().parent
     source = path_from_yaml(config.get("input_segy"), base, "input_segy")
     target = path_from_yaml(config.get("output_segy"), base, "output_segy")
     if not source.is_file():
         raise FileNotFoundError(f"Input SEG-Y not found: {source}")
-    if source == target:
+    if write_segy and source == target:
         raise ValueError("output_segy must differ from input_segy")
     if not target.parent.is_dir():
         raise FileNotFoundError(f"Output directory does not exist: {target.parent}")
-    temporary_parent = path_from_yaml(
-        config.get("temporary_directory", str(target.parent)), base,
-        "temporary_directory",
-    )
-    if not temporary_parent.is_dir():
-        raise FileNotFoundError(f"Temporary directory does not exist: {temporary_parent}")
-    cache_directory = None
-    if config.get("cache_directory") is not None:
-        cache_directory = path_from_yaml(
-            config["cache_directory"], base, "cache_directory"
-        )
-        if cache_directory.exists() and not cache_directory.is_dir():
-            raise NotADirectoryError(f"Cache path is not a directory: {cache_directory}")
+    cache_directory = (path_from_yaml(config["cache_directory"], base, "cache_directory")
+                       if config.get("cache_directory") is not None
+                       else target.parent / ".destriping_cache")
+    if cache_directory.exists() and not cache_directory.is_dir():
+        raise NotADirectoryError(f"Cache path is not a directory: {cache_directory}")
+    if config.get("temporary_directory") is not None:
+        print("Ignoring temporary_directory; working files stay inside the destriping cache")
     on_existing = config.get("on_existing", "prompt")
     if on_existing not in ("prompt", "reuse", "recalculate"):
         raise ValueError("on_existing must be 'prompt', 'reuse', or 'recalculate'")
@@ -349,14 +432,7 @@ def run_pipeline(config, config_file):
     rms = section(config, "rms", RMS_KEYS)
     mask = section(config, "mask", MASK_KEYS)
     attenuation = section(config, "attenuation", ATTENUATION_KEYS)
-    application = section(
-        config, "application", {"overwrite_output", "trace_chunk_size"}, required=False
-    )
-    if not isinstance(application.get("overwrite_output", False), bool):
-        raise ValueError("application.overwrite_output must be true or false")
-    if "trace_chunk_size" in application:
-        print("Ignoring application.trace_chunk_size; chunk size is automatic")
-    if target.exists() and not application.get("overwrite_output", False):
+    if write_segy and target.exists() and not application.get("overwrite_output", False):
         raise FileExistsError(f"Output already exists: {target}")
 
     mode = rms.get("window_mode")
@@ -378,44 +454,47 @@ def run_pipeline(config, config_file):
         sample_settings[key] = value
     if "trace_chunk_size" in rms:
         print("Ignoring rms.trace_chunk_size; chunk size is automatic")
-    if mode == "constant":
-        if "constant_top" not in rms or "constant_bottom" not in rms:
-            raise ValueError("Constant RMS mode needs constant_top and constant_bottom")
-        try:
-            top = float(rms["constant_top"])
-            bottom = float(rms["constant_bottom"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Constant RMS top/bottom must be numeric") from exc
-        if (not np.isfinite(top) or not np.isfinite(bottom) or
-                (bottom != create_rms_map.END_OF_TRACE and top >= bottom)):
-            raise ValueError("Constant RMS window requires finite top < bottom, or bottom: -1")
-    else:
-        if ("horizon_file" not in rms or "horizon_z_unit" not in rms or
-                not rms.get("horizon_windows")):
-            raise ValueError(
-                "Horizon RMS mode needs horizon_file, horizon_z_unit, and horizon_windows"
-            )
+    legacy_constant = mode == "constant" and "windows" not in rms
+    if mode == "horizon":
+        if "horizon_file" not in rms or "horizon_z_unit" not in rms:
+            raise ValueError("Horizon RMS mode needs horizon_file and horizon_z_unit")
         horizon_file = path_from_yaml(rms["horizon_file"], base, "rms.horizon_file")
-        if not isinstance(rms["horizon_windows"], list):
-            raise ValueError("rms.horizon_windows must be a list of [lower, upper] pairs")
-        windows = []
-        for index, pair in enumerate(rms["horizon_windows"]):
-            try:
-                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                    raise ValueError
-                lower, upper = (float(value) for value in pair)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"rms.horizon_windows[{index}] must be [lower, upper]") from exc
-            if (not np.isfinite(lower) or not np.isfinite(upper) or
-                    (upper != create_rms_map.END_OF_TRACE and lower >= upper)):
-                raise ValueError(
-                    f"rms.horizon_windows[{index}] needs finite lower < upper, or upper: -1"
-                )
-            windows.append((lower, upper))
+        create_rms_map.z_scale(rms["horizon_z_unit"], domain)
+        if "windows" in rms and "horizon_windows" in rms:
+            raise ValueError("Use rms.windows or rms.horizon_windows, not both")
+        specification = rms.get("windows", rms.get("horizon_windows"))
+        window_name = "rms.windows" if "windows" in rms else "rms.horizon_windows"
+    else:
+        if "windows" in rms and ("constant_top" in rms or "constant_bottom" in rms):
+            raise ValueError("Use rms.windows or constant_top/constant_bottom, not both")
+        if legacy_constant:
+            if "constant_top" not in rms or "constant_bottom" not in rms:
+                raise ValueError("Constant RMS mode needs rms.windows or constant_top/constant_bottom")
+            specification = [[rms["constant_top"], rms["constant_bottom"]]]
+            window_name = "rms.constant_top/constant_bottom"
+        else:
+            specification = rms["windows"]
+            window_name = "rms.windows"
+    end_value = None
+    for entry in specification if isinstance(specification, list) else ():
+        try:
+            stepped_to_end = (isinstance(entry, (list, tuple)) and len(entry) == 3 and
+                              float(entry[1]) == create_rms_map.END_OF_TRACE)
+        except (TypeError, ValueError, IndexError):
+            stepped_to_end = False
+        if stepped_to_end:
+            end_value = stepped_trace_end(
+                source, rms, mode, horizon_file if mode == "horizon" else None,
+                sample_settings, domain,
+            )
+            break
+    windows = parse_windows(specification, window_name, end_value)
 
     mask_mode = mask.get("mode")
     if mask_mode not in ("interactive", "vertices"):
         raise ValueError("mask.mode must be 'interactive' or 'vertices'")
+    if mask.get("scope") is not None and mask["scope"] not in ("single", "multiple"):
+        raise ValueError("mask.scope must be 'single' or 'multiple'")
     for key in ("pad_inline_meters", "pad_crossline_meters"):
         if key not in mask:
             raise ValueError(f"mask.{key} is required in the parameter file")
@@ -428,7 +507,7 @@ def run_pipeline(config, config_file):
         mask[key] = value
     if mask_mode == "interactive":
         preview_index = mask.get("preview_map_index", 0)
-        map_count = 1 if mode == "constant" else len(windows)
+        map_count = len(windows)
         if not isinstance(preview_index, int) or not 0 <= preview_index < map_count:
             raise ValueError("mask.preview_map_index is outside the RMS map list")
     if mask_mode == "vertices":
@@ -447,7 +526,7 @@ def run_pipeline(config, config_file):
     if existing_maps is not None:
         if not isinstance(existing_maps, list) or not existing_maps:
             raise ValueError("rms.existing_maps must be a nonempty list of paths")
-        expected = 1 if mode == "constant" else len(windows)
+        expected = len(windows)
         if len(existing_maps) != expected:
             raise ValueError(f"rms.existing_maps needs {expected} map path(s)")
         if "inlines_file" not in rms or "crosslines_file" not in rms:
@@ -464,7 +543,7 @@ def run_pipeline(config, config_file):
         raw_b = mask["existing_blended_maps"]
         if not isinstance(raw_b, list) or not raw_b:
             raise ValueError("mask.existing_blended_maps must be a nonempty list of paths")
-        expected = 1 if mode == "constant" else len(windows)
+        expected = len(windows)
         if len(raw_b) != expected:
             raise ValueError(f"mask.existing_blended_maps needs {expected} map path(s)")
         existing_blended = [path_from_yaml(p, base, "mask.existing_blended_maps") for p in raw_b]
@@ -504,7 +583,7 @@ def run_pipeline(config, config_file):
             if not np.isfinite(value) or value < minimum or (key == "alpha" and value >= 1):
                 raise ValueError(f"attenuation.{key} has an invalid value")
             normalized_attenuation[key] = value
-    for key in ("preview_hardcoded_passes", "save_pass_differences"):
+    for key in ("preview_hardcoded_passes", "save_pass_pngs"):
         if key in attenuation and not isinstance(attenuation[key], bool):
             raise ValueError(f"attenuation.{key} must be true or false")
 
@@ -513,7 +592,7 @@ def run_pipeline(config, config_file):
     }
     for key in RMS_KEYS - {
         "window_mode", "vertical_domain", "horizon_file", "existing_maps",
-        "inlines_file", "crosslines_file", "trace_chunk_size",
+        "inlines_file", "crosslines_file", "trace_chunk_size", "windows",
     }:
         if key in rms:
             rms_overrides[key] = rms[key]
@@ -521,9 +600,10 @@ def run_pipeline(config, config_file):
     if mode == "horizon":
         rms_overrides["horizon_file"] = str(horizon_file)
         rms_overrides["horizon_windows"] = windows
+        rms_overrides["constant_windows"] = None
     else:
-        rms_overrides["constant_top"] = top
-        rms_overrides["constant_bottom"] = bottom
+        rms_overrides["constant_windows"] = None if legacy_constant else windows
+        rms_overrides["constant_top"], rms_overrides["constant_bottom"] = windows[0]
     fp_overrides = {
         "vertical_domain": domain, "inline_increment": spacing[0],
         "crossline_increment": spacing[1], "rms_window_mode": "absolute",
@@ -536,6 +616,7 @@ def run_pipeline(config, config_file):
     }
     for key in ATTENUATION_KEYS - {
         "parameter_input_mode", "pass_parameters", "colormap_file",
+        "png_output_directory",
     } - mask_feathering_keys:
         if key in normalized_attenuation:
             fp_overrides[key] = normalized_attenuation[key]
@@ -543,6 +624,18 @@ def run_pipeline(config, config_file):
         fp_overrides["colormap_file"] = str(path_from_yaml(
             attenuation["colormap_file"], base, "attenuation.colormap_file"
         ))
+    png_directory = None
+    if attenuation.get("save_pass_pngs", False):
+        png_directory = (path_from_yaml(attenuation["png_output_directory"], base,
+                                        "attenuation.png_output_directory")
+                         if attenuation.get("png_output_directory") is not None else target.parent)
+    if png_directory is not None and png_directory.exists() and not png_directory.is_dir():
+        raise NotADirectoryError(f"PNG output path is not a directory: {png_directory}")
+    fp_overrides.update(
+        png_output_directory=str(png_directory) if png_directory is not None else None,
+        coefficient_output_directory=str(cache_directory),
+        output_name_prefix=target.stem,
+    )
 
     saved = []
     def override(module, settings):
@@ -551,10 +644,9 @@ def run_pipeline(config, config_file):
             setattr(module, name, value)
 
     try:
-        if cache_directory is not None:
-            cache_directory.mkdir(parents=True, exist_ok=True)
+        cache_directory.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
-            prefix="destriping-", dir=temporary_parent
+            prefix="destriping-", dir=cache_directory
         ) as working_name:
             working = Path(working_name)
             print(f"Temporary work directory: {working}", flush=True)
@@ -562,29 +654,38 @@ def run_pipeline(config, config_file):
             new_il_file = working / "inlines.npy"
             new_xl_file = working / "crosslines.npy"
             bundle_file = working / "coefficients.npz"
-            if mode == "constant":
-                new_maps = [new_rms_file]
-            else:
+            if mode == "horizon":
                 new_maps = [create_rms_map.output_for_window(
                     new_rms_file, index, lower, upper,
                     rms["horizon_z_unit"],
                 ) for index, (lower, upper) in enumerate(windows, 1)]
+            elif legacy_constant:
+                new_maps = [new_rms_file]
+            else:
+                unit = "ms" if domain == "time" else "m"
+                new_maps = [create_rms_map.output_for_constant_window(
+                    new_rms_file, index, lower, upper, unit,
+                ) for index, (lower, upper) in enumerate(windows, 1)]
 
+            cached_base = cache_directory / "rms.npy"
+            if mode == "horizon":
+                cached_maps = [create_rms_map.output_for_window(
+                    cached_base, index, lower, upper,
+                    rms["horizon_z_unit"],
+                ) for index, (lower, upper) in enumerate(windows, 1)]
+            elif legacy_constant:
+                cached_maps = [cached_base]
+            else:
+                unit = "ms" if domain == "time" else "m"
+                cached_maps = [create_rms_map.output_for_constant_window(
+                    cached_base, index, lower, upper, unit,
+                ) for index, (lower, upper) in enumerate(windows, 1)]
+            cached_il = cache_directory / "inlines.npy"
+            cached_xl = cache_directory / "crosslines.npy"
             if existing_maps is not None:
                 maps, il_file, xl_file = existing_maps, existing_il, existing_xl
-            elif cache_directory is not None:
-                cached_base = cache_directory / "rms.npy"
-                if mode == "constant":
-                    maps = [cached_base]
-                else:
-                    maps = [create_rms_map.output_for_window(
-                        cached_base, index, lower, upper,
-                        rms["horizon_z_unit"],
-                    ) for index, (lower, upper) in enumerate(windows, 1)]
-                il_file = cache_directory / "inlines.npy"
-                xl_file = cache_directory / "crosslines.npy"
             else:
-                maps, il_file, xl_file = new_maps, new_il_file, new_xl_file
+                maps, il_file, xl_file = cached_maps, cached_il, cached_xl
             required_rms = [il_file, xl_file] + [
                 path for map_file in maps
                 for path in (map_file, window_sidecar(map_file))
@@ -615,14 +716,12 @@ def run_pipeline(config, config_file):
                         path for map_file in new_maps
                         for path in (map_file, window_sidecar(map_file))
                     ],
-                    required_rms,
+                    [cached_il, cached_xl] + [
+                        path for map_file in cached_maps
+                        for path in (map_file, window_sidecar(map_file))
+                    ],
                 ):
                     publish_file(fresh, saved_path)
-
-                # Persist scope choice if saved by create_rms_map
-                work_scope_file = new_rms_file.with_name(new_rms_file.stem + "_mask_scope.txt")
-                if work_scope_file.is_file() and cache_directory is not None:
-                    publish_file(work_scope_file, cache_directory / (maps[0].stem + "_mask_scope.txt"))
 
             # -------------------------------------------------------------
             # Stage 2: Survey Mask & Blended RMS Generation
@@ -632,16 +731,16 @@ def run_pipeline(config, config_file):
                             len(np.load(new_xl_file, allow_pickle=False)))
             working_blended_maps = [m.with_name(m.stem + "_blended.npy") for m in new_maps]
 
-            if existing_blended is not None:
-                saved_blended_maps = existing_blended
-            elif cache_directory is not None:
-                saved_blended_maps = [cache_directory / (m.stem + "_blended.npy") for m in maps]
-            else:
-                saved_blended_maps = working_blended_maps
+            cached_blended_maps = [
+                cache_directory / (m.stem + "_blended.npy") for m in new_maps
+            ]
+            saved_blended_maps = (existing_blended if existing_blended is not None
+                                 else cached_blended_maps)
 
             required_blended = [
                 path for b_map in saved_blended_maps
-                for path in (b_map, window_sidecar(b_map), mask_sidecar(b_map))
+                for path in (b_map, window_sidecar(b_map), mask_sidecar(b_map),
+                             taper_sidecar(b_map))
             ]
 
             reuse_blended = choose_saved_files("blended RMS maps", required_blended, on_existing)
@@ -650,9 +749,11 @@ def run_pipeline(config, config_file):
                     shutil.copyfile(saved_b, work_b)
                     shutil.copyfile(window_sidecar(saved_b), window_sidecar(work_b))
                     load_valid_mask(saved_b, survey_shape)
+                    load_mask_taper(saved_b, survey_shape)
                     shutil.copyfile(mask_sidecar(saved_b), mask_sidecar(work_b))
+                    shutil.copyfile(taper_sidecar(saved_b), taper_sidecar(work_b))
             else:
-                mask_scope = get_mask_scope(mask, maps, working, cache_directory)
+                mask_scope = get_mask_scope(mask, maps) if mask_mode == "interactive" else "single"
                 print(f"Masking strategy: {mask_scope.upper()} ({len(new_maps)} map{'s' if len(new_maps) > 1 else ''})", flush=True)
 
                 if mask_mode == "interactive":
@@ -663,16 +764,21 @@ def run_pipeline(config, config_file):
                     blend_configured_mask(mask, new_maps, il_arr, xl_arr, working_blended_maps, spacing, normalized_attenuation)
 
                 # Validate and publish blended maps and duplicate window metadata
-                for work_m, work_b, saved_b in zip(new_maps, working_blended_maps, saved_blended_maps):
+                for work_m, work_b, saved_b in zip(new_maps, working_blended_maps,
+                                                  cached_blended_maps):
                     if not work_b.is_file():
                         raise RuntimeError(f"Expected blended map was not generated: {work_b}")
                     if not mask_sidecar(work_b).is_file():
                         raise RuntimeError(f"Expected survey mask was not generated: {mask_sidecar(work_b)}")
+                    if not taper_sidecar(work_b).is_file():
+                        raise RuntimeError(f"Expected mask taper was not generated: {taper_sidecar(work_b)}")
                     load_valid_mask(work_b, survey_shape)
+                    load_mask_taper(work_b, survey_shape)
                     shutil.copyfile(window_sidecar(work_m), window_sidecar(work_b))
                     publish_file(work_b, saved_b)
                     publish_file(window_sidecar(work_b), window_sidecar(saved_b))
                     publish_file(mask_sidecar(work_b), mask_sidecar(saved_b))
+                    publish_file(taper_sidecar(work_b), taper_sidecar(saved_b))
 
             # -------------------------------------------------------------
             # Stage 3: Destriping Attenuation on Pre-Blended Maps
@@ -690,14 +796,22 @@ def run_pipeline(config, config_file):
             # -------------------------------------------------------------
             # Stage 4: SEG-Y Trace Compensation
             # -------------------------------------------------------------
-            print("Stage 4/4: compensating SEG-Y", flush=True)
-            apply_destriping.apply_coefficients(
-                source, bundle_file, target,
-                sample_interval_override=sample_settings["sample_interval_override"],
-                sample_start_override=sample_settings["sample_start_override"],
-                overwrite_output=application.get("overwrite_output", False),
-            )
-        print(f"Complete: {target}; temporary files removed", flush=True)
+            if write_segy:
+                print("Stage 4/4: compensating SEG-Y", flush=True)
+                apply_destriping.apply_coefficients(
+                    source, bundle_file, target,
+                    sample_interval_override=sample_settings["sample_interval_override"],
+                    sample_start_override=sample_settings["sample_start_override"],
+                    overwrite_output=application.get("overwrite_output", False),
+                )
+            else:
+                print("Stage 4/4: skipped SEG-Y writing (application.write_segy: false)",
+                      flush=True)
+        if write_segy:
+            print(f"Complete: {target}; temporary files removed", flush=True)
+        else:
+            print("Complete: previews and per-map coefficients saved; no SEG-Y written; "
+                  "temporary files removed", flush=True)
     finally:
         for module, name, value in reversed(saved):
             setattr(module, name, value)

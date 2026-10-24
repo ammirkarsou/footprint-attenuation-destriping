@@ -1,10 +1,14 @@
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from matplotlib.colors import TwoSlopeNorm
 from pathlib import Path as FilePath
 from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 from matplotlib.widgets import Button
 from numpy.lib.stride_tricks import sliding_window_view
+from numba import njit, prange
 import re
 import ast
 import json
@@ -20,8 +24,17 @@ def mask_sidecar(map_file):
     return path.with_name(path.stem + "_mask.npy")
 
 
+def taper_sidecar(map_file):
+    path = FilePath(map_file)
+    return path.with_name(path.stem + "_taper.npy")
+
+
 def save_valid_mask(map_file, valid):
     np.save(mask_sidecar(map_file), np.asarray(valid, dtype=np.bool_))
+
+
+def save_mask_taper(map_file, taper):
+    np.save(taper_sidecar(map_file), np.asarray(taper, dtype=np.float32))
 
 
 def load_valid_mask(map_file, shape):
@@ -32,6 +45,17 @@ def load_valid_mask(map_file, shape):
     if valid.shape != shape or valid.dtype != np.bool_:
         raise ValueError(f"{path}: expected a boolean mask with shape {shape}")
     return valid
+
+
+def load_mask_taper(map_file, shape):
+    path = taper_sidecar(map_file)
+    if not path.is_file():
+        return None
+    taper = np.load(path, allow_pickle=False)
+    if (taper.shape != shape or not np.issubdtype(taper.dtype, np.floating)
+            or not np.all(np.isfinite(taper)) or np.any((taper < 0) | (taper > 1))):
+        raise ValueError(f"{path}: expected finite float weights in [0, 1] with shape {shape}")
+    return taper.astype(np.float32, copy=False)
 
 
 def load_seismic_colormap(cmap_path, name="custom_seismic", smooth=True):
@@ -84,10 +108,53 @@ def preview_colormap(path):
         return "viridis"
 
 
+def save_map_png(path, data, extent, cmap, title, colorbar_label, vmin=None, vmax=None,
+                 norm=None):
+    """Write a map without opening an interactive preview window."""
+    figure = Figure(figsize=(12, 8), dpi=150)
+    FigureCanvasAgg(figure)
+    axes = figure.add_subplot(111)
+    image = axes.imshow(
+        data, origin="lower", aspect="auto", extent=extent, cmap=cmap,
+        vmin=vmin, vmax=vmax, norm=norm, interpolation="nearest",
+    )
+    axes.set_title(title)
+    axes.set_xlabel("Crossline")
+    axes.set_ylabel("Inline")
+    figure.colorbar(image, ax=axes, label=colorbar_label)
+    figure.savefig(path, bbox_inches="tight")
+
+
 # -------------------------------------------------------------
 # 1. 1D Directional Filtering Engine
 # -------------------------------------------------------------
-def alpha_trimmed_mean_1d(arr, axis, win_size, alpha=0.2):
+@njit(parallel=True, cache=True)
+def _alpha_trimmed_partition_rows(data, active_mask, win_size, n_trim):
+    """Compute only active centers, without gathering/sorting whole window grids."""
+    nrows, ncols = data.shape
+    out = data.copy()
+    pad = win_size // 2
+    n_keep = win_size - 2 * n_trim
+    for row in prange(nrows):
+        for col in range(ncols):
+            if active_mask is not None and not active_mask[row, col]:
+                continue
+            window = np.empty(win_size, dtype=np.float32)
+            for k in range(win_size):
+                neighbor = col + k - pad
+                neighbor = min(max(neighbor, 0), ncols - 1)
+                window[k] = data[row, neighbor]
+            if n_trim:
+                window = np.partition(window, (n_trim, win_size - n_trim - 1))
+            total = 0.0  # Accumulate in float64 to limit error for long windows.
+            for k in range(n_trim, win_size - n_trim):
+                total += window[k]
+            out[row, col] = total / n_keep
+    return out
+
+
+def _alpha_trimmed_mean_numpy(arr, axis, win_size, alpha=0.2, valid_mask=None):
+    """Original sorted-window implementation for short or non-float32 inputs."""
     if win_size % 2 == 0:
         win_size += 1
 
@@ -99,28 +166,67 @@ def alpha_trimmed_mean_1d(arr, axis, win_size, alpha=0.2):
         raise ValueError(f"Alpha {alpha} is too high for window size {win_size}. No elements left.")
 
     data = np.ascontiguousarray(arr.T) if axis == 0 else np.ascontiguousarray(arr)
+    if valid_mask is not None:
+        if valid_mask.shape != arr.shape or valid_mask.dtype != np.bool_:
+            raise ValueError("Filter mask must be boolean and match the input map")
+        active_mask = valid_mask.T if axis == 0 else valid_mask
+    else:
+        active_mask = None
     nrows, ncols = data.shape
     # Allow room for the window view, its sorted copy, and the output.
     chunk_size = min(nrows, max(1, TARGET_WORKING_BYTES //
                                 (4 * ncols * win_size * data.dtype.itemsize)))
-    out = np.empty_like(data)
+    # Outside samples retain their input values and remain available to every
+    # neighboring filter window; only masked centers need a filtered result.
+    out = data.copy() if active_mask is not None else np.empty_like(data)
 
     padded = np.pad(data, ((0, 0), (pad_w, pad_w)), mode="edge")
 
     for r_start in range(0, nrows, chunk_size):
         r_end = min(r_start + chunk_size, nrows)
+        if active_mask is not None:
+            active = active_mask[r_start:r_end]
+            if not np.any(active):
+                continue
         windows = sliding_window_view(padded[r_start:r_end, :], win_size, axis=1)
+        if active_mask is not None:
+            windows = windows[active]
         if n_trim > 0:
             sorted_win = np.sort(windows, axis=-1)
-            out[r_start:r_end, :] = np.mean(sorted_win[..., n_trim : win_size - n_trim], axis=-1)
+            values = np.mean(sorted_win[..., n_trim : win_size - n_trim], axis=-1)
         else:
-            out[r_start:r_end, :] = np.mean(windows, axis=-1)
+            values = np.mean(windows, axis=-1)
+        if active_mask is not None:
+            out[r_start:r_end, :][active] = values
+        else:
+            out[r_start:r_end, :] = values
 
     return np.ascontiguousarray(out.T) if axis == 0 else out
 
 
-def run_alpha_trim_pipeline(data, pipeline_steps, inc_il, inc_xl):
-    result = data.copy()
+def alpha_trimmed_mean_1d(arr, axis, win_size, alpha=0.2, valid_mask=None):
+    if win_size % 2 == 0:
+        win_size += 1
+    n_trim = int(np.floor(alpha * win_size / 2.0))
+    if win_size - 2 * n_trim <= 0:
+        raise ValueError(f"Alpha {alpha} is too high for window size {win_size}. No elements left.")
+    if valid_mask is not None and (valid_mask.shape != arr.shape or valid_mask.dtype != np.bool_):
+        raise ValueError("Filter mask must be boolean and match the input map")
+
+    # Small windows already run quickly with NumPy. The compiled partition
+    # pays off for longer windows and finite float32 RMS/difference maps.
+    if win_size < 64 or arr.dtype != np.float32 or not np.all(np.isfinite(arr)):
+        return _alpha_trimmed_mean_numpy(arr, axis, win_size, alpha, valid_mask)
+
+    data = np.ascontiguousarray(arr.T) if axis == 0 else np.ascontiguousarray(arr)
+    active = (np.ascontiguousarray(valid_mask.T if axis == 0 else valid_mask)
+              if valid_mask is not None else None)
+    out = _alpha_trimmed_partition_rows(data, active, win_size, n_trim)
+    return np.ascontiguousarray(out.T) if axis == 0 else out
+
+
+def run_alpha_trim_pipeline(data, pipeline_steps, inc_il, inc_xl, valid_mask=None):
+    result = data
     for direction, win_m, alpha_val in pipeline_steps:
         axis = 0 if direction == "inline" else 1
         inc = inc_il if direction == "inline" else inc_xl
@@ -130,7 +236,8 @@ def run_alpha_trim_pipeline(data, pipeline_steps, inc_il, inc_xl):
 
         print(f" -> Running {direction.upper()} filter: {win_samples} samples ({win_m:.0f}m), alpha={alpha_val}")
         result = alpha_trimmed_mean_1d(
-            result, axis=axis, win_size=win_samples, alpha=alpha_val
+            result, axis=axis, win_size=win_samples, alpha=alpha_val,
+            valid_mask=valid_mask,
         )
     return result
 
@@ -306,12 +413,21 @@ def load_holes(polygon_path):
 # -------------------------------------------------------------
 # 2. Input Preparation (Pre-Blended Map Ingestion)
 # -------------------------------------------------------------
-def prepare_input(blended_map, ilines, crosslines):
+def prepare_input(blended_map, ilines, crosslines, valid_mask=None, taper=None):
     shape = (len(ilines), len(crosslines))
     if blended_map.shape != shape:
         raise ValueError(f"Blended RMS shape {blended_map.shape} does not match ({len(ilines)}, {len(crosslines)})")
     if not np.any(np.isfinite(blended_map)):
         raise ValueError("Blended RMS map contains no finite samples")
+    if valid_mask is not None:
+        if valid_mask.shape != shape or valid_mask.dtype != np.bool_:
+            raise ValueError(f"Expected a boolean mask with shape {shape}")
+        if not np.any(valid_mask):
+            raise ValueError("Survey mask contains no inside cells")
+    if taper is not None:
+        if valid_mask is None or taper.shape != shape:
+            raise ValueError("Taper must match the survey mask")
+        valid_mask = valid_mask | (taper > 0)
 
     n_pad_il = int(np.round(pad_inline_meters / inline_increment)) if pad_inline_meters else 0
     n_pad_xl = int(np.round(pad_crossline_meters / crossline_increment)) if pad_crossline_meters else 0
@@ -332,42 +448,79 @@ def prepare_input(blended_map, ilines, crosslines):
 
     return {
         "input": padded,
+        "valid_mask": (np.pad(valid_mask, ((n_pad_il, n_pad_il),
+                                       (n_pad_xl, n_pad_xl)),
+                              mode="constant", constant_values=False)
+                       if valid_mask is not None else None),
+        "taper": (np.pad(taper, ((n_pad_il, n_pad_il), (n_pad_xl, n_pad_xl)),
+                         mode="constant", constant_values=0)
+                  if taper is not None else None),
         "core": core,
         "extent": [padded_xl.min() - xl_step / 2, padded_xl.max() + xl_step / 2,
                    padded_il.min() - il_step / 2, padded_il.max() + il_step / 2],
+        "core_extent": [crosslines.min() - xl_step / 2, crosslines.max() + xl_step / 2,
+                        ilines.min() - il_step / 2, ilines.max() + il_step / 2],
     }
 
 
-def run_pass(input_map, parameters):
+def run_pass(input_map, parameters, valid_mask=None, taper=None):
+    if valid_mask is not None:
+        if valid_mask.shape != input_map.shape or valid_mask.dtype != np.bool_:
+            raise ValueError("Pass mask must be boolean and match the input map")
+        if not np.any(valid_mask):
+            raise ValueError("Pass mask contains no inside cells")
+    if taper is not None:
+        if (valid_mask is None or taper.shape != input_map.shape
+                or not np.all(np.isfinite(taper)) or np.any((taper < 0) | (taper > 1))):
+            raise ValueError("Pass taper must contain finite weights in [0, 1] and match the mask")
     primary_filter, short_filter, long_filter, a1 = validate_pass(parameters)
     primary_steps = [(primary_filter[1], primary_filter[0], alpha)] * primary_filter[2]
     short_steps = [(short_filter[1], short_filter[0], alpha)] * short_filter[2]
     long_steps = [(long_filter[1], long_filter[0], alpha)] * long_filter[2]
 
-    primary_filtered = run_alpha_trim_pipeline(
-        input_map, primary_steps, inline_increment, crossline_increment
+    def filter_inside(data, steps):
+        if valid_mask is None:
+            return run_alpha_trim_pipeline(
+                data, steps, inline_increment, crossline_increment
+            )
+        return run_alpha_trim_pipeline(
+            data, steps, inline_increment, crossline_increment,
+            valid_mask=valid_mask,
+        )
+
+    primary_filtered = filter_inside(input_map, primary_steps)
+    if valid_mask is None:
+        difference = primary_filtered - input_map
+    else:
+        difference = np.zeros_like(input_map)
+        np.subtract(primary_filtered, input_map, out=difference, where=valid_mask)
+    short_difference = filter_inside(difference, short_steps)
+    threshold = a1 * np.nanstd(
+        short_difference if valid_mask is None else short_difference[valid_mask]
     )
-    difference = primary_filtered - input_map
-    short_difference = run_alpha_trim_pipeline(
-        difference, short_steps, inline_increment, crossline_increment
-    )
-    threshold = a1 * np.nanstd(short_difference)
     large_difference = np.abs(difference) > threshold
-    long_difference = run_alpha_trim_pipeline(
-        difference, long_steps, inline_increment, crossline_increment
-    )
+    long_difference = filter_inside(difference, long_steps)
     selected_difference = np.where(large_difference, long_difference, difference)
-    filtered_difference = run_alpha_trim_pipeline(
-        selected_difference, short_steps, inline_increment, crossline_increment
-    )
-    result = input_map + filtered_difference
+    filtered_difference = filter_inside(selected_difference, short_steps)
+    if valid_mask is None:
+        result = input_map + filtered_difference
+    else:
+        result = input_map.copy()
+        np.add(input_map, filtered_difference, out=result, where=valid_mask)
     coefficient = np.ones_like(result, dtype=np.float32)
     np.divide(result, input_map, out=coefficient,
-              where=np.isfinite(input_map) & (np.abs(input_map) > 1e-12))
-    filtered_coefficient = run_alpha_trim_pipeline(
-        coefficient, short_steps, inline_increment, crossline_increment
-    )
-    output = input_map * filtered_coefficient
+              where=np.isfinite(input_map) & (np.abs(input_map) > 1e-12)
+              & (valid_mask if valid_mask is not None else True))
+    filtered_coefficient = filter_inside(coefficient, short_steps)
+    if taper is not None:
+        # Taper the correction, not the coefficient itself: outside the ramp
+        # the multiplier must be 1, not 0. Subsequent passes see this output.
+        filtered_coefficient = (1.0 + taper * (filtered_coefficient - 1.0)).astype(np.float32)
+    if valid_mask is None:
+        output = input_map * filtered_coefficient
+    else:
+        output = input_map.copy()
+        np.multiply(input_map, filtered_coefficient, out=output, where=valid_mask)
     return {
         "difference": difference, "short_difference": short_difference,
         "long_difference": long_difference, "filtered_difference": filtered_difference,
@@ -503,7 +656,7 @@ def show_pass(map_file, number, parameters, input_map, result, extent, cmap):
     btn_toggle = Button(ax_btn_toggle, "Toggle Input / Output (Space)", color="#d9edf7", hovercolor="#bce8f1")
     btn_diff = Button(ax_btn_diff, "Difference (D)", color="#f5f5f5", hovercolor="#e0e0e0")
     btn_aspect = Button(ax_btn_aspect, "Aspect: AUTO", color="#f5f5f5", hovercolor="#e0e0e0")
-    btn_done = Button(ax_btn_done, "Done / Accept (Enter)", color="#dff0d8", hovercolor="#d0e9c6")
+    btn_done = Button(ax_btn_done, "Close Preview (Enter)", color="#dff0d8", hovercolor="#d0e9c6")
 
     btn_toggle.on_clicked(toggle_input_output)
     btn_diff.on_clicked(lambda e: update_view("diff"))
@@ -530,8 +683,10 @@ def parse_pass_input(raw, default):
     return validate_user_pass(values)
 
 
-def select_passes(map_file, prepared, cmap):
+def select_passes(map_file, prepared, cmap, on_accepted_pass=None):
     current = prepared["input"]
+    valid_mask = prepared.get("valid_mask")
+    taper = prepared.get("taper")
     cumulative = np.ones_like(current, dtype=np.float32)
     accepted = []
     suggestion = 0
@@ -556,7 +711,8 @@ def select_passes(map_file, prepared, cmap):
                 break
             parameters = validate_user_pass(pass_parameters[suggestion])
 
-        result = run_pass(current, parameters)
+        result = (run_pass(current, parameters) if valid_mask is None
+                  else run_pass(current, parameters, valid_mask=valid_mask, taper=taper))
         if parameter_input_mode == "interactive":
             show_pass(map_file, len(accepted)+1, parameters, current, result,
                       prepared["extent"], cmap)
@@ -578,23 +734,45 @@ def select_passes(map_file, prepared, cmap):
                 break
         else:
             if preview_hardcoded_passes:
-                show_pass(map_file, len(accepted)+1, parameters, current, result,
-                          prepared["extent"], cmap)
+                while True:
+                    show_pass(map_file, len(accepted)+1, parameters, current, result,
+                              prepared["extent"], cmap)
+                    while True:
+                        try:
+                            raw = input(
+                                "Accept this pass [Enter], or enter a replacement "
+                                "(f1, f2, f3, a1) to recalculate and preview: "
+                            ).strip()
+                        except EOFError:
+                            raw = ""
+                        if not raw:
+                            replacement = None
+                            break
+                        try:
+                            replacement = parse_pass_input(raw, None)
+                            break
+                        except ValueError as exc:
+                            print(exc)
+                    if replacement is None:
+                        break
+                    parameters = replacement
+                    result = (run_pass(current, parameters) if valid_mask is None
+                              else run_pass(current, parameters, valid_mask=valid_mask,
+                                            taper=taper))
             choice = "n"
 
         current = result["output"]
         cumulative *= result["filtered_coefficient"]
         accepted.append(parameters)
-        if save_pass_differences:
-            stem = map_file.with_suffix("")
-            np.save(f"{stem}_pass_{len(accepted)}_diff_short.npy", result["short_difference"])
-            np.save(f"{stem}_pass_{len(accepted)}_diff_long.npy", result["long_difference"])
+        if on_accepted_pass is not None:
+            on_accepted_pass(len(accepted), current)
         if choice == "f":
             break
         suggestion += 1
 
     if not accepted:
         raise ValueError("pass_parameters must contain at least one tuple")
+    print(f"Accepted passes for {map_file.name}: {accepted}")
     return cumulative, current, accepted
 
 
@@ -650,7 +828,16 @@ def main():
             "graphical desktop. Install PyQt5 and run with MPLBACKEND=QtAgg "
             "if needed, or use hardcoded mode without previews."
         )
-    cmap = preview_colormap(colormap_file) if needs_plot else None
+    if save_pass_pngs and png_output_directory is None:
+        raise ValueError("png_output_directory is required when save_pass_pngs is true")
+    png_directory = (FilePath(png_output_directory)
+                     if save_pass_pngs else None)
+    coefficient_directory = (FilePath(coefficient_output_directory)
+                             if coefficient_output_directory is not None else None)
+    for directory in (png_directory, coefficient_directory):
+        if directory is not None and directory.exists() and not directory.is_dir():
+            raise NotADirectoryError(f"Artifact path is not a directory: {directory}")
+    cmap = preview_colormap(colormap_file) if needs_plot or png_directory is not None else None
 
     map_entries = [parse_rms_map_entry(entry) for entry in rms_maps]
     horizon_grid = None
@@ -702,11 +889,17 @@ def main():
         if np.any(after[valid] <= before[valid]):
             raise ValueError("RMS window centers overlap or change order on the survey grid")
 
+    if png_directory is not None:
+        png_directory.mkdir(parents=True, exist_ok=True)
+    if coefficient_directory is not None:
+        coefficient_directory.mkdir(parents=True, exist_ok=True)
+
     completed = []
-    for map_file, top_grid, bottom_grid in specifications:
+    for map_number, (map_file, top_grid, bottom_grid) in enumerate(specifications, 1):
         blended_rms = np.load(map_file)
         finite_window = np.isfinite(top_grid) & np.isfinite(bottom_grid)
         valid_mask = load_valid_mask(map_file, survey_shape)
+        taper = load_mask_taper(map_file, survey_shape)
 
         # Check raw unblended RMS map if present (to verify original finite bounds)
         raw_map_file = map_file.with_name(map_file.name.replace("_blended.npy", ".npy"))
@@ -718,18 +911,42 @@ def main():
             raw_rms = None
 
         print(f"\nProcessing Destriping on Blended Map: {map_file.name}")
-        prepared = prepare_input(blended_rms, ilines, crosslines)
-
-        coefficients, _, accepted = select_passes(map_file, prepared, cmap)
-
+        prepared = prepare_input(blended_rms, ilines, crosslines, valid_mask, taper)
+        artifact_stem = f"{output_name_prefix or 'destriping'}_map_{map_number:03d}_{map_file.stem}"
         core = prepared["core"]
+        map_extent = prepared["core_extent"]
+        if png_directory is not None:
+            map_input = prepared["input"][core]
+            finite_input = map_input[np.isfinite(map_input)]
+            amplitude_max = (float(np.percentile(finite_input, 99.9))
+                             if finite_input.size else 1.0)
+            amplitude_max = max(amplitude_max, 1.0)
+            save_map_png(
+                png_directory / f"{artifact_stem}_step_000_input.png",
+                map_input, map_extent, cmap, f"{map_file.stem} | Input blended RMS",
+                "RMS Amplitude", vmin=0, vmax=amplitude_max,
+            )
+
+        def save_accepted_pass(number, output):
+            if png_directory is not None:
+                save_map_png(
+                    png_directory / f"{artifact_stem}_step_{number:03d}_output.png",
+                    output[core], map_extent, cmap,
+                    f"{map_file.stem} | Pass {number} output",
+                    "RMS Amplitude", vmin=0, vmax=amplitude_max,
+                )
+
+        coefficients, _, accepted = select_passes(
+            map_file, prepared, cmap, on_accepted_pass=save_accepted_pass,
+        )
+
         coeff_grid = coefficients[core].copy()
 
-        # Outside horizon bounds and the selected survey boundary, including
-        # holes, lock coefficients to 1.0 so the SEG-Y samples are unchanged.
+        # Outside horizon bounds and the full mask ramp, lock coefficients to 1.
         coeff_grid[~finite_window] = 1.0
-        if valid_mask is not None:
-            coeff_grid[~valid_mask] = 1.0
+        effective_mask = taper > 0 if taper is not None else valid_mask
+        if effective_mask is not None:
+            coeff_grid[~effective_mask] = 1.0
         if raw_rms is not None:
             coeff_grid[~np.isfinite(raw_rms)] = 1.0
             coeff_grid[raw_rms <= 0] = 1.0
@@ -744,10 +961,39 @@ def main():
         corrected_file = map_file.with_name(map_file.stem + "_corrected.npy")
         np.save(coefficient_file, coeff_grid)
         np.save(corrected_file, corrected_rms)
+        final_stem = f"{artifact_stem}_step_999_coefficient"
+        if coefficient_directory is not None:
+            persistent_coefficient = coefficient_directory / f"{final_stem}.npy"
+            np.save(persistent_coefficient, coeff_grid)
+            print(f"Saved final coefficient array: {persistent_coefficient}")
+        if png_directory is not None:
+            deviations = np.abs(coeff_grid[np.isfinite(coeff_grid)] - 1.0)
+            coefficient_scale = max(float(np.percentile(deviations, 99))
+                                    if deviations.size else 0.0, 0.01)
+            save_map_png(
+                png_directory / f"{final_stem}.png", coeff_grid, map_extent,
+                "bwr", f"{map_file.stem} | Final combined coefficient",
+                "Scale Factor", norm=TwoSlopeNorm(
+                    vmin=1.0-coefficient_scale, vcenter=1.0,
+                    vmax=1.0+coefficient_scale,
+                ),
+            )
+            expected_pngs = {
+                f"{artifact_stem}_step_000_input.png",
+                f"{final_stem}.png",
+            }
+            expected_pngs.update(
+                f"{artifact_stem}_step_{number:03d}_output.png"
+                for number in range(1, len(accepted) + 1)
+            )
+            for old_png in png_directory.glob(f"{artifact_stem}_step_*.png"):
+                if old_png.name not in expected_pngs:
+                    old_png.unlink()
+            print(f"Saved input, {len(accepted)} pass output(s), and coefficient PNG in {png_directory}")
         print(f"Saved {coefficient_file.name} and {corrected_file.name}")
         completed.append((
             map_file, coeff_grid, top_grid, bottom_grid,
-            valid_mask if valid_mask is not None else np.ones(survey_shape, dtype=np.bool_),
+            effective_mask if effective_mask is not None else np.ones(survey_shape, dtype=np.bool_),
             accepted,
         ))
 
@@ -796,7 +1042,10 @@ alpha = None
 parameter_input_mode = None
 pass_parameters = None
 preview_hardcoded_passes = False
-save_pass_differences = False
+save_pass_pngs = False
+png_output_directory = None
+coefficient_output_directory = None
+output_name_prefix = None
 
 if __name__ == "__main__":
     raise SystemExit("Run python run_pipeline.py <parameter-file.yml> to configure attenuation")

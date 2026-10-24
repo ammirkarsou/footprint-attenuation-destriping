@@ -33,6 +33,7 @@ window_mode = None
 vertical_domain = None
 constant_top = None
 constant_bottom = None
+constant_windows = None
 horizon_file = None
 horizon_z_unit = None
 horizon_windows = None
@@ -288,11 +289,17 @@ def output_for_window(path, index, lower, upper, unit):
     )
 
 
-def prompt_mask_choice(saved_maps, inlines, crosslines, base_output_path):
-    """Plot all RMS maps in a single figure and prompt user for mask strategy."""
+def output_for_constant_window(path, index, top, bottom, unit):
+    target = Path(path)
+    suffix = f"{top:g}{unit}_to_end" if bottom == END_OF_TRACE else f"{top:g}_{bottom:g}{unit}"
+    return target.with_name(f"{target.stem}_constant_{index}_{suffix}{target.suffix}")
+
+
+def show_rms_preview(saved_maps, inlines, crosslines):
+    """Show the calculated RMS maps before the separate masking stage."""
     n_maps = len(saved_maps)
     if n_maps == 0:
-        return "single"
+        return
 
     is_interactive = matplotlib.get_backend().lower() not in {
         "agg", "pdf", "ps", "svg", "cairo", "template"
@@ -300,8 +307,11 @@ def prompt_mask_choice(saved_maps, inlines, crosslines, base_output_path):
 
     fig = None
     if is_interactive:
-        ncols = min(n_maps, 3)
-        nrows = int(np.ceil(n_maps / ncols))
+        preview_indices = (list(range(n_maps)) if n_maps <= 6 else
+                           sorted({0, n_maps // 2, n_maps - 1}))
+        n_preview = len(preview_indices)
+        ncols = min(n_preview, 3)
+        nrows = int(np.ceil(n_preview / ncols))
         fig, axes = plt.subplots(
             nrows, ncols, figsize=(6.5 * ncols, 5.0 * nrows), squeeze=False
         )
@@ -316,7 +326,8 @@ def prompt_mask_choice(saved_maps, inlines, crosslines, base_output_path):
             inlines.max() + il_step / 2,
         ]
 
-        for idx, (path, grid, label) in enumerate(saved_maps):
+        for idx, map_index in enumerate(preview_indices):
+            path, grid, label = saved_maps[map_index]
             ax = axes_flat[idx]
             valid_vals = grid[np.isfinite(grid) & (grid > 0)]
             if valid_vals.size > 0:
@@ -340,68 +351,22 @@ def prompt_mask_choice(saved_maps, inlines, crosslines, base_output_path):
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="RMS Amplitude")
 
         # Hide any unused subplots
-        for idx in range(n_maps, len(axes_flat)):
+        for idx in range(n_preview, len(axes_flat)):
             axes_flat[idx].set_visible(False)
 
         fig.suptitle(
-            f"Generated RMS Maps ({n_maps} map{'s' if n_maps > 1 else ''})",
+            f"Generated RMS Maps ({n_maps} total; {n_preview} shown) — close to continue",
             fontsize=13,
             fontweight="bold",
             y=0.99,
         )
         plt.tight_layout()
-        plt.ion()
-        plt.show()
-        plt.pause(0.2)
+        plt.show(block=True)
     else:
         print("\nNote: Non-interactive backend detected; skipping visual display.")
 
-    print("\n" + "=" * 65)
-    print(f"SURVEY MASK CONFIGURATION: {n_maps} RMS map{'s' if n_maps > 1 else ''} available")
-    print("=" * 65)
-
-    if n_maps > 1:
-        prompt_msg = (
-            "Do you want to make a [s]ingle mask for all RMS maps "
-            "or [m]ultiple masks (one for each map)? [single/multiple] (default: single): "
-        )
-    else:
-        prompt_msg = (
-            "Do you want to proceed with a [s]ingle mask for this RMS map? [single] (default: single): "
-        )
-
-    choice = "single"
-    while True:
-        try:
-            raw = input(prompt_msg).strip().lower()
-        except EOFError:
-            raw = "single"
-            break
-        if raw in ("", "s", "single", "all", "one", "1"):
-            choice = "single"
-            break
-        if raw in ("m", "multiple", "each", "separate", "2"):
-            choice = "multiple"
-            break
-        print("Please enter 'single' (or 's') or 'multiple' (or 'm').")
-
-    print(
-        f"\nSelected masking strategy: "
-        f"{'SINGLE MASK (one mask for all maps)' if choice == 'single' else 'MULTIPLE MASKS (separate mask per map)'}"
-    )
-
-    # Save choice to a sidecar file so run_pipeline.py can read it directly
-    choice_file = Path(base_output_path).with_name(
-        Path(base_output_path).stem + "_mask_scope.txt"
-    )
-    choice_file.write_text(choice, encoding="utf-8")
-    print(f"Mask preference saved to: {choice_file}\n")
-
     if fig is not None:
         plt.close(fig)
-        plt.ioff()
-
-    return choice
 
 
 def main():
@@ -428,11 +393,17 @@ def main():
         scale = z_scale(horizon_z_unit, vertical_domain)
         if not horizon_windows:
             raise ValueError("horizon_windows must contain at least one interval")
-        for lower, upper in horizon_windows:
-            if (not np.isfinite(lower) or not np.isfinite(upper) or
-                    (upper != END_OF_TRACE and lower >= upper)):
-                raise ValueError(f"Invalid horizon window: {(lower, upper)}")
+        selected_windows = horizon_windows
         points, horizon_z = read_horizon(horizon_file)
+    else:
+        selected_windows = (constant_windows if constant_windows is not None else
+                            [(constant_top, constant_bottom)])
+        if not selected_windows:
+            raise ValueError("Constant mode needs at least one window")
+    for lower, upper in selected_windows:
+        if (not np.isfinite(lower) or not np.isfinite(upper) or
+                (upper != END_OF_TRACE and lower >= upper)):
+            raise ValueError(f"Invalid {window_mode} window: {(lower, upper)}")
 
     with segyio.open(input_file, mode="r", strict=False, ignore_geometry=True) as f:
         f.mmap()
@@ -471,30 +442,39 @@ def main():
         print(f"Horizon coverage: {np.isfinite(horizon_at_traces).sum()}/{n_traces} traces")
         if not np.any(np.isfinite(horizon_at_traces)):
             raise ValueError("Horizon does not cover any SEG-Y trace positions")
-        windows = []
-        for i, (lower, upper) in enumerate(horizon_windows, 1):
-            top = horizon_at_traces * scale + lower * scale
+
+    windows = []
+    for i, (lower, upper) in enumerate(selected_windows, 1):
+        if upper == END_OF_TRACE and window_mode == "constant" and lower >= last_sample:
+            raise ValueError("Constant RMS top must precede the last SEG-Y sample")
+        if window_mode == "horizon":
+            output_path = output_for_window(output_rms_npy, i, lower, upper, horizon_z_unit)
+            label = (f"Horizon Window {i} ({lower:g} {horizon_z_unit} - end)" if
+                     upper == END_OF_TRACE else
+                     f"Horizon Window {i} ({lower:g} - {upper:g} {horizon_z_unit})")
+        else:
+            output_path = (Path(output_rms_npy) if constant_windows is None else
+                           output_for_constant_window(output_rms_npy, i, lower, upper, unit_label))
+            label = (f"Constant Window {i} ({lower:g} - "
+                     f"{'end' if upper == END_OF_TRACE else f'{upper:g} {unit_label}'})")
+        windows.append((lower, upper, output_path, label))
+
+    def bounds_for_chunk(lower, upper, first, last):
+        count = last - first
+        if window_mode == "constant":
+            top = np.full(count, lower, dtype=np.float64)
+            bottom = np.full(count, last_sample if upper == END_OF_TRACE else upper,
+                             dtype=np.float64)
+        else:
+            picks = horizon_at_traces[first:last]
+            top = (picks + lower) * scale
             if upper == END_OF_TRACE:
                 valid = np.isfinite(top) & (top < last_sample)
                 top = np.where(valid, top, np.nan)
                 bottom = np.where(valid, last_sample, np.nan)
-                label = f"Horizon Window {i} ({lower:g} {horizon_z_unit} - end)"
             else:
-                bottom = horizon_at_traces * scale + upper * scale
-                label = f"Horizon Window {i} ({lower:g} - {upper:g} {horizon_z_unit})"
-            windows.append((top, bottom,
-                            output_for_window(output_rms_npy, i, lower, upper, horizon_z_unit),
-                            label))
-    else:
-        bottom = last_sample if constant_bottom == END_OF_TRACE else constant_bottom
-        if constant_top >= bottom:
-            raise ValueError("Constant RMS top must precede the last SEG-Y sample")
-        windows = [
-            (np.full(n_traces, constant_top), np.full(n_traces, bottom),
-             Path(output_rms_npy),
-             f"Constant Window ({constant_top:g} - "
-             f"{'end' if constant_bottom == END_OF_TRACE else f'{constant_bottom:g} {unit_label}'})")
-        ]
+                bottom = (picks + upper) * scale
+        return top, bottom
 
     il_unique = np.unique(inlines)
     xl_unique = np.unique(crosslines)
@@ -507,12 +487,13 @@ def main():
             "RMS maps require one trace per grid cell"
         )
 
-    indices = [sample_indices(top, bottom, start, interval)
-               for top, bottom, _, _ in windows]
-    top_indices = np.stack([pair[0] for pair in indices])
-    bottom_indices = np.stack([pair[1] for pair in indices])
-    rms_grids = [np.full((len(il_unique), len(xl_unique)), np.nan, dtype=np.float32)
-                 for _ in windows]
+    grid_shape = (len(il_unique), len(xl_unique))
+    rms_grids = []
+    for _, _, output_path, _ in windows:
+        grid = np.lib.format.open_memmap(output_path, mode="w+", dtype=np.float32,
+                                         shape=grid_shape)
+        grid[:] = np.nan
+        rms_grids.append(grid)
     print(f"Calculating {len(windows)} RMS window(s) in one SEG-Y trace pass")
     with segyio.open(input_file, mode="r", strict=False, ignore_geometry=True) as f:
         f.mmap()
@@ -520,14 +501,19 @@ def main():
         for first in range(0, n_traces, chunk_size):
             last = min(first + chunk_size, n_traces)
             traces = np.ascontiguousarray(trace_reader[first:last], dtype=np.float32)
+            indices = [sample_indices(*bounds_for_chunk(lower, upper, first, last),
+                                      start, interval)
+                       for lower, upper, _, _ in windows]
+            top_indices = np.stack([pair[0] for pair in indices])
+            bottom_indices = np.stack([pair[1] for pair in indices])
             values = calculate_multi_window_rms_numba(
-                traces, top_indices[:, first:last], bottom_indices[:, first:last]
+                traces, top_indices, bottom_indices
             )
             for window_index, grid in enumerate(rms_grids):
                 grid[grid_il[first:last], grid_xl[first:last]] = values[window_index]
 
     saved_maps = []
-    for window_index, ((top, bottom, output_path, label), rms_grid) in enumerate(
+    for window_index, ((lower, upper, output_path, label), rms_grid) in enumerate(
         zip(windows, rms_grids)
     ):
         valid_count = np.count_nonzero(np.isfinite(rms_grid))
@@ -537,9 +523,10 @@ def main():
                 "check horizon units, sample interval/start, and window offsets"
             )
         print(f"Valid RMS bins: {valid_count}/{n_traces} traces")
-        np.save(output_path, rms_grid)
-        top_grid = np.full(rms_grid.shape, np.nan, dtype=np.float32)
-        bottom_grid = np.full(rms_grid.shape, np.nan, dtype=np.float32)
+        rms_grid.flush()
+        top, bottom = bounds_for_chunk(lower, upper, 0, n_traces)
+        top_grid = np.full(grid_shape, np.nan, dtype=np.float32)
+        bottom_grid = np.full(grid_shape, np.nan, dtype=np.float32)
         top_grid[grid_il, grid_xl] = top
         bottom_grid[grid_il, grid_xl] = bottom
         window_file = output_path.with_name(output_path.stem + "_window.npz")
@@ -548,8 +535,7 @@ def main():
             inlines=il_unique, crosslines=xl_unique,
             vertical_domain=vertical_domain,
             z_unit="ms" if vertical_domain == "time" else "m",
-            bottom_to_end=(constant_bottom == END_OF_TRACE if window_mode == "constant"
-                           else horizon_windows[window_index][1] == END_OF_TRACE),
+            bottom_to_end=upper == END_OF_TRACE,
             sample_interval=interval, sample_start=start,
         )
         print(f"RMS map saved: {output_path} (Shape: {rms_grid.shape})")
@@ -561,8 +547,7 @@ def main():
     print(f"Coordinate axes saved to {output_il_npy} and {output_xl_npy}")
 
     # Display all calculated RMS maps in a single figure and prompt user for mask strategy
-    choice = prompt_mask_choice(saved_maps, il_unique, xl_unique, output_rms_npy)
-    return choice
+    show_rms_preview(saved_maps, il_unique, xl_unique)
 
 
 if __name__ == "__main__":
