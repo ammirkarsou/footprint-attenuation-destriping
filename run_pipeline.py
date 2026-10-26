@@ -391,13 +391,24 @@ def run_pipeline(config, config_file):
     if unknown:
         raise ValueError(f"Unknown top-level setting(s): {', '.join(sorted(unknown))}")
     application = section(
-        config, "application", {"overwrite_output", "write_segy", "trace_chunk_size"},
+        config, "application", {
+            "overwrite_output", "write_segy", "trace_chunk_size",
+            "vertical_taper_fraction",
+        },
         required=False,
     )
     for key, default in (("overwrite_output", False), ("write_segy", True)):
         if not isinstance(application.get(key, default), bool):
             raise ValueError(f"application.{key} must be true or false")
     write_segy = application.get("write_segy", True)
+    if isinstance(application.get("vertical_taper_fraction", 0.10), bool):
+        raise ValueError("application.vertical_taper_fraction must be numeric")
+    try:
+        vertical_taper_fraction = float(application.get("vertical_taper_fraction", 0.10))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("application.vertical_taper_fraction must be numeric") from exc
+    if not np.isfinite(vertical_taper_fraction) or not 0 < vertical_taper_fraction < 0.5:
+        raise ValueError("application.vertical_taper_fraction must be between 0 and 0.5")
     if "trace_chunk_size" in application:
         print("Ignoring application.trace_chunk_size; chunk size is automatic")
     base = Path(config_file).resolve().parent
@@ -608,6 +619,7 @@ def run_pipeline(config, config_file):
         "vertical_domain": domain, "inline_increment": spacing[0],
         "crossline_increment": spacing[1], "rms_window_mode": "absolute",
         "parameter_input_mode": input_mode, "pass_parameters": normalized_passes,
+        "vertical_taper_fraction": vertical_taper_fraction,
     }
     # Feathering lengths are consumed by the mask stage, not attenuation.
     mask_feathering_keys = {

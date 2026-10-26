@@ -8,14 +8,14 @@ from pathlib import Path
 import numpy as np
 import segyio
 
-from coefficient_interpolation import apply_coefficients_chunk
+from coefficient_interpolation import apply_coefficients_chunk, INTERPOLATION_METHOD
 from create_rms_map import optimal_trace_chunk
 
 
 def load_coefficient_bundle(path):
     required = {
         "coefficients", "top_z", "bottom_z", "inlines", "crosslines",
-        "vertical_domain", "z_unit", "interpolation",
+        "vertical_domain", "z_unit", "interpolation", "vertical_taper_fraction",
     }
     with np.load(path, allow_pickle=False) as saved:
         missing = required.difference(saved.files)
@@ -59,10 +59,13 @@ def load_coefficient_bundle(path):
     unit = str(bundle["z_unit"].item())
     if (domain, unit) not in (("time", "ms"), ("depth", "m")):
         raise ValueError("Bundle vertical domain/unit must be time/ms or depth/m")
-    if str(bundle["interpolation"].item()) != (
-        "linear_at_window_centers_taper_to_one_at_outer_bounds"
-    ):
+    if str(bundle["interpolation"].item()) != INTERPOLATION_METHOD:
         raise ValueError("Unsupported coefficient interpolation method")
+    bundle["vertical_taper_fraction"] = float(bundle["vertical_taper_fraction"])
+    if not np.isfinite(bundle["vertical_taper_fraction"]) or not (
+        0 < bundle["vertical_taper_fraction"] < 0.5
+    ):
+        raise ValueError("Vertical taper fraction must be between 0 and 0.5")
     if "sample_interval" in bundle and (
         not np.isfinite(bundle["sample_interval"]) or bundle["sample_interval"] <= 0 or
         not np.isfinite(bundle["sample_start"])
@@ -189,7 +192,7 @@ def apply_coefficients(input_path, bundle_path, output_path, *,
                 corrected, changed_flags, overflow = apply_coefficients_chunk(
                     traces, il_index[first:last], xl_index[first:last], z_samples,
                     data["top_z"], data["bottom_z"], data["coefficients"],
-                    data.get("valid_masks"),
+                    data.get("valid_masks"), data["vertical_taper_fraction"],
                 )
                 bad = np.flatnonzero(overflow)
                 if bad.size:

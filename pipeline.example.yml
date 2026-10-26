@@ -92,3 +92,4 @@ attenuation:
 application:
   overwrite_output: true
   write_segy: true  # false: inspect pass previews/PNGs and coefficients without writing SEG-Y
+  vertical_taper_fraction: 0.10  # cosine transition over 10% of each window at each edge

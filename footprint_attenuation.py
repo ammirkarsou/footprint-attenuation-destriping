@@ -13,6 +13,9 @@ import re
 import ast
 import json
 from create_rms_map import END_OF_TRACE, TARGET_WORKING_BYTES
+from coefficient_interpolation import (
+    DEFAULT_VERTICAL_TAPER_FRACTION, INTERPOLATION_METHOD,
+)
 
 
 DEFAULT_FILTER_DIRECTIONS = ("inline", "crossline", "crossline")
@@ -801,6 +804,8 @@ def main():
         raise ValueError("Padding distances must be non-negative")
     if parameter_input_mode not in ("interactive", "hardcoded"):
         raise ValueError("parameter_input_mode must be 'interactive' or 'hardcoded'")
+    if not np.isfinite(vertical_taper_fraction) or not 0 < vertical_taper_fraction < 0.5:
+        raise ValueError("vertical_taper_fraction must be between 0 and 0.5")
     if parameter_input_mode == "hardcoded" and not pass_parameters:
         raise ValueError("Configure at least one tuple in pass_parameters for hardcoded mode")
     for index, parameters in enumerate(pass_parameters, start=1):
@@ -1010,11 +1015,13 @@ def main():
         z_unit="ms" if vertical_domain == "time" else "m",
         rms_files=np.asarray([str(entry[0]) for entry in completed]),
         passes_json=json.dumps([entry[5] for entry in completed]),
-        interpolation="linear_at_window_centers_taper_to_one_at_outer_bounds",
+        interpolation=INTERPOLATION_METHOD,
+        vertical_taper_fraction=vertical_taper_fraction,
         **sample_metadata,
     )
     print(f"\nSaved vertical interpolation bundle: {output_bundle_file}")
-    print("Apply coefficients at SEG-Y samples by interpolating through each trace's window centers.")
+    print(f"Apply each coefficient across its RMS window with cosine transitions "
+          f"over {vertical_taper_fraction:.0%} at each edge.")
 
 
 # Runtime paths and processing settings are supplied by run_pipeline.py.
@@ -1046,6 +1053,7 @@ save_pass_pngs = False
 png_output_directory = None
 coefficient_output_directory = None
 output_name_prefix = None
+vertical_taper_fraction = DEFAULT_VERTICAL_TAPER_FRACTION
 
 if __name__ == "__main__":
     raise SystemExit("Run python run_pipeline.py <parameter-file.yml> to configure attenuation")
